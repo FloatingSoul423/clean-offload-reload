@@ -1,113 +1,101 @@
-# Algorithm and evolution
+# 算法与演化过程
 
-## Problem
+## 问题背景
 
-Long tool-using sessions leave large KV prefixes idle while external tools run.
-Keeping every prefix in HBM limits concurrency. Offloading too much creates a
-burst of host-to-device traffic when several tools return together, increasing
-time to first token (TTFT). The scheduler must decide both how much KV may leave
-HBM and when it must return.
+长上下文、工具调用型会话在等待外部工具时，会让很大的 KV 前缀暂时闲置。把每个
+前缀都留在 HBM 中会限制并发量；但卸载过多又会在多个工具同时返回时产生突发的
+H2D 流量，拉高首 Token 延迟（TTFT）。因此，调度器需要同时决定可以从 HBM
+卸载多少 KV，以及这些 KV 必须在什么时候恢复。
 
-## Shared-link service curve
+## 共享链路服务曲线
 
-For tool-waiting session `i`, let `deadline_i` be a conditional early-return
-quantile and `missing_i` the bytes that must be restored. From the current time:
+对于正在等待工具的会话 `i`，令 `deadline_i` 表示条件提前返回分位点，
+`missing_i` 表示必须恢复的字节数。从当前时刻开始定义：
 
 ```text
 C(t) = safety * B_available * t
-D(t) = sum(missing_i for deadline_i <= t)
+D(t) = sum(deadline_i <= t 的 missing_i)
 ```
 
-`B_available` is the minimum of the configured ceiling and the median of the
-five most recent completed-transfer throughput samples. With one preemptible
-shared H2D link, an admitted state is feasible only if:
+`B_available` 取配置上限与最近 5 次已完成传输吞吐率中位数的较小值。当所有任务
+共享一条可抢占 H2D 链路时，只有满足下式的状态才能被准入：
 
 ```text
-D(t) <= C(t) for every deadline prefix
+每个截止时间前缀都满足 D(t) <= C(t)
 ```
 
-The maximum additional bytes session `i` may evict are bounded by the minimum
-unused capacity of every later prefix:
+会话 `i` 可以额外驱逐的最大字节数，由所有更晚前缀中的最小剩余容量决定：
 
 ```text
-max_evict_i = min(C(t) - D(t) for t >= deadline_i)
+max_evict_i = min(C(t) - D(t), 其中 t >= deadline_i)
 ```
 
-Eviction considers far deadlines first. Reload follows earliest deadline first
-and is submitted in bounded chunks.
+驱逐时优先选择截止时间较远的会话；恢复时采用 EDF，优先处理截止时间最近的
+会话，并把传输拆成大小受限的分块。
 
-## v9.1 demand gating
+## v9.1 需求门控
 
-The service curve is a safety ceiling, not an instruction to fill all available
-PCIe capacity. v9.1 creates new eviction work only when measured HBM headroom
-falls below the low watermark after pending allocation is included:
+服务曲线是安全上限，并不意味着控制器应当占满所有可用 PCIe 容量。v9.1 只有在
+计入待分配空间后，实测 HBM 余量低于低水位时，才会创建新的驱逐任务：
 
 ```text
-if HBM_available - predicted_allocation < reserve_low:
+如果 HBM_available - predicted_allocation < reserve_low：
     need = reserve_high - HBM_available + predicted_allocation
     new_evict = min(need, service_curve_safe_evictable)
-else:
+否则：
     new_evict = 0
 ```
 
-Existing missing work may still reload when no new eviction is allowed. When
-HBM telemetry is unavailable, v9.1 fails closed for new eviction. The runtime
-also maintains a conservative deadline floor and performs reserve maintenance
-only when its scheduler and transfer pipeline are idle.
+即使不允许新增驱逐，已有的缺失数据仍可继续恢复。当 HBM 遥测不可用时，v9.1
+对新增驱逐采用 fail closed 策略。运行时还会维护保守的截止时间驻留下限，并且只在
+调度器和传输流水线都空闲时维护保留空间。
 
-## Evolution
+## 演化过程
 
-### v8.1 runtime
+### v8.1 运行时
 
-The runtime milestone moved deadline-floor enforcement into SGLang and fixed
-residency invariants around asynchronous reload, radix-tree mutation, producer
-reservation, and host-resource release ordering. This is the required base for
-all later controllers.
+该里程碑把截止时间驻留下限的执行放入 SGLang 运行时，并修复了异步恢复、
+Radix 树修改、producer 预留和主机资源释放顺序中的 residency 不变量问题。
+后续所有控制器都以此运行时为基础。
 
-### v9.0 cumulative service curve
+### v9.0 累计服务曲线
 
-v9.0 replaced fixed per-request bandwidth with a global cumulative EDF
-feasibility test. A single session can use the whole idle link, while many
-sessions share one prefix budget. Its weakness was treating all safe capacity as
-desirable eviction capacity, which increased H2D traffic under large-model
-stress.
+v9.0 用全局累计 EDF 可行性检查替换了固定的单请求带宽分配。只有一个会话时，
+它可以使用整条空闲链路；存在多个会话时，所有会话共享同一个前缀预算。它的缺点
+是把所有安全容量都当成了值得使用的驱逐容量，在大模型压力测试中增加了 H2D
+流量。
 
-### v9.1 selected default
+### v9.1 当前选定版本
 
-v9.1 separated how much must be evicted for HBM space from how much could be
-evicted without missing a reload deadline. Demand gating answers the first; the
-service curve bounds the second. A 5%/30% HBM hysteresis band, 0.5 GiB chunks,
-measured bandwidth, and a one-second reload lead reduced repeated emergency
-recovery in the tested configuration.
+v9.1 将两个问题分开处理：为了腾出 HBM 空间必须驱逐多少，以及在不违反恢复截止
+时间的前提下最多可以驱逐多少。需求门控回答前一个问题，服务曲线约束后一个问题。
+在测试配置中，5%/30% HBM 双水位、0.5 GiB 分块、实测带宽和提前 1 秒恢复减少
+了反复出现的紧急恢复。
 
-### Variants not selected
+### 未选用的变体
 
-A Goodput-first v9.2 added foreground request gating, 0.125 GiB foreground
-chunks, and prioritization around a fixed 250 ms threshold. It produced 29/46
-SLO successes on one 14B seed but 24/48 on another. The two-seed total was 53/94
-(56.4%), so the apparent gain was not stable enough to replace v9.1.
+Goodput-first v9.2 增加了前台请求门控、0.125 GiB 前台分块，以及围绕固定 250 ms
+阈值的优先级排序。在一个 14B seed 中，它取得 29/46 个 SLO 成功请求；换一个
+seed 后只有 24/48。两个 seed 合计为 53/94（56.4%），因此表面收益还不足以稳定
+替代 v9.1。
 
-An aggressive peak-aware v9.3 doubled the look-ahead and shortened the idle
-submission period. It reduced emergency evictions but increased H2D traffic and
-dropped Goodput to 24/46 in its screening run. It was reverted. These variants
-remain in the research repository history, not in this clean release.
+更激进的高峰感知 v9.3 将预测窗口扩大一倍，并缩短空闲期提交间隔。它减少了紧急
+驱逐，但增加了 H2D 流量，筛查实验中的 Goodput 降至 24/46，因此已经回滚。
+这些变体保留在研究仓库的 Git 历史中，不放入这个干净的发布仓库。
 
-## Where v9.1 fits
+## v9.1 的适用范围
 
-v9.1 targets multi-session, long-context inference where KV restores are much
-larger than new tool observations and H2D bandwidth is shared. It is most useful
-when tool waits provide time to schedule restore work and HBM pressure varies.
-Native LRU remains simpler when the working set fits in HBM, tool returns are
-not predictable, or transfer telemetry is unavailable.
+v9.1 面向多会话、长上下文推理。在这类负载中，KV 恢复量远大于新的工具观察文本，
+并且多个会话共享 H2D 带宽。当工具等待时间足以安排恢复任务、HBM 压力会随时间
+变化时，它最有价值。如果工作集可以完整放入 HBM、工具返回时间不可预测，或者
+无法获得传输遥测，原生 LRU 会是更简单的选择。
 
-## Known limitations
+## 已知限制
 
-- The deadline is a probability quantile, not a hard completion time.
-- HTTP acceptance confirms a residency target was queued, not that H2D finished.
-  The client lacks a runtime-owned intent reconciler and exact in-flight byte
-  accounting.
-- The model assumes one preemptible shared H2D link. NUMA- or GPU-bound transfer
-  paths need one service curve per link.
-- The performance runs are targeted screenings, not a full independent
-  multi-model evaluation. Re-run paired LRU and controller arms on the target
-  hardware before drawing deployment conclusions.
+- 截止时间来自概率分位点，不是真实的硬完成时间。
+- HTTP 接受响应只能证明驻留目标已经排队，不能证明 H2D 已经完成。客户端目前还
+  缺少由运行时持有的 intent reconciler 和精确的在途字节统计。
+- 当前模型假设只有一条可抢占的共享 H2D 链路。受 NUMA 或 GPU 绑定的传输路径
+  需要为每条链路分别维护服务曲线。
+- 现有性能结果属于定向筛查，不是完整、独立的多模型评测。在目标硬件上部署前，
+  应重新进行 LRU 与控制器的配对实验。
