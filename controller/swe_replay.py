@@ -687,6 +687,87 @@ def read_c2g_counters(base, timeout=1.0):
     return totals["bytes"], totals["time"]
 
 
+def read_hbm_pressure(base, timeout=1.0):
+    """Read the destination KV-pool state used by the v9.1 HBM constraint."""
+    wanted = {
+        "sglang:kv_available_tokens",
+        "sglang:max_total_num_tokens",
+        "sglang:pending_prealloc_token_usage",
+        "sglang:num_queue_reqs",
+    }
+    values = {name: [] for name in wanted}
+    with urllib.request.urlopen(base + "/metrics", timeout=timeout) as response:
+        for line in response.read().decode().splitlines():
+            if line.startswith("#"):
+                continue
+            name = line.split("{", 1)[0].split(None, 1)[0]
+            if name not in wanted:
+                continue
+            try:
+                values[name].append(float(line.rsplit(None, 1)[1]))
+            except ValueError:
+                continue
+    if not values["sglang:kv_available_tokens"] or not values[
+        "sglang:max_total_num_tokens"
+    ]:
+        return None
+    return {
+        "available_tokens": max(values["sglang:kv_available_tokens"]),
+        "capacity_tokens": max(values["sglang:max_total_num_tokens"]),
+        "pending_prealloc_usage": max(
+            values["sglang:pending_prealloc_token_usage"] or [0.0]
+        ),
+        "queued_requests": sum(values["sglang:num_queue_reqs"] or [0.0]),
+    }
+
+
+class ObservedHBMPressure:
+    """Cache HBM pressure telemetry and fail closed for new eviction."""
+
+    def __init__(self, base, poll_s=0.1):
+        if poll_s <= 0:
+            raise ValueError("HBM poll interval must be positive")
+        self.base = base
+        self.poll_s = poll_s
+        self.last_poll = float("-inf")
+        self.current = None
+        self.samples = 0
+        self.sample_errors = 0
+
+    def update(self, now):
+        if now - self.last_poll < self.poll_s:
+            return self.current
+        self.last_poll = now
+        try:
+            sample = read_hbm_pressure(self.base)
+        except Exception:
+            self.sample_errors += 1
+            return self.current
+        if sample is None:
+            self.sample_errors += 1
+            return self.current
+        self.current = sample
+        self.samples += 1
+        return self.current
+
+    def snapshot(self):
+        return {
+            "samples": self.samples,
+            "sample_errors": self.sample_errors,
+            "current": self.current,
+        }
+
+    def adjust_available_tokens(self, delta):
+        """Account for an accepted target update before the next scrape."""
+        if self.current is None:
+            return
+        self.current = dict(self.current)
+        self.current["available_tokens"] = min(
+            self.current["capacity_tokens"],
+            max(0.0, self.current["available_tokens"] + delta),
+        )
+
+
 class ObservedServiceRate:
     """Estimate the usable single-link service rate from completed H2D copies."""
 
@@ -757,14 +838,20 @@ def service_curve_utilization(states, now, bandwidth_bytes_s, safety=0.9):
     return peak
 
 
-def plan_service_curve_targets(states, now, bandwidth_bytes_s, safety=0.9):
+def plan_service_curve_targets(
+    states,
+    now,
+    bandwidth_bytes_s,
+    safety=0.9,
+    eviction_need_bytes=math.inf,
+):
     """Allocate the largest EDF-feasible missing-byte curve, far deadlines first.
 
     ``committed_missing_bytes`` protects already accepted Evict work ahead of
     new admissions. ``max_missing_bytes`` is the most a wait may currently
-    have outside HBM. Existing waits set both to their applied missing amount,
-    so a later plan may Reload them but never re-Evict them. A new wait starts
-    with zero committed bytes and its whole KV eligible for curve slack.
+    have outside HBM. ``eviction_need_bytes`` caps only new missing work; the
+    PCIe curve may further reduce it. Reloaded bytes remain ineligible until a
+    later conditional-deadline epoch explicitly reopens them.
     """
     if bandwidth_bytes_s <= 0 or not 0 < safety <= 1:
         raise ValueError("bandwidth and safety must be positive")
@@ -801,11 +888,20 @@ def plan_service_curve_targets(states, now, bandwidth_bytes_s, safety=0.9):
 
     for state in ordered:
         allocate(state, state["committed_missing_bytes"])
+    remaining_need = max(0.0, eviction_need_bytes)
     for state in ordered:
+        if remaining_need <= 0:
+            break
+        before = allocated[state["session_id"]]
         allocate(
             state,
-            state["max_missing_bytes"] - state["committed_missing_bytes"],
+            min(
+                remaining_need,
+                state["max_missing_bytes"]
+                - state["committed_missing_bytes"],
+            ),
         )
+        remaining_need -= allocated[state["session_id"]] - before
     targets = {
         session_id: state["total_bytes"] - allocated[session_id]
         for session_id, state in states.items()
@@ -830,16 +926,45 @@ class ServiceCurveEDFPolicy:
         observe_bandwidth=True,
         bandwidth_poll_s=0.5,
         bandwidth_window=5,
+        observe_hbm=True,
+        hbm_poll_s=0.1,
+        reserve_low=0.05,
+        reserve_high=0.30,
+        queued_allocation_tokens=1024,
+        reload_chunk_gb=0.5,
+        reload_cooldown_s=0.2,
+        max_conditional_epochs=2,
+        prefetch_lead_s=1.0,
         **kwargs,
     ):
         if not 0 < safety <= 1:
             raise ValueError("service-curve safety must be in (0, 1]")
+        if not 0 <= reserve_low < reserve_high < 1:
+            raise ValueError("HBM reserves must satisfy 0 <= low < high < 1")
+        if (
+            queued_allocation_tokens < 0
+            or reload_chunk_gb <= 0
+            or reload_cooldown_s <= 0
+            or max_conditional_epochs < 0
+            or prefetch_lead_s < 0
+        ):
+            raise ValueError("allocation prediction and Reload chunk are invalid")
         self.base = base
         self.stop = stop
         self.interval = interval
         self.bytes_per_token = bytes_per_token
         self.shared_bytes_s = shared_gbps * GB
         self.safety = safety
+        self.mean = mean
+        self.sigma = sigma
+        self.quantile = quantile
+        self.reserve_low = reserve_low
+        self.reserve_high = reserve_high
+        self.queued_allocation_tokens = queued_allocation_tokens
+        self.reload_chunk_bytes = reload_chunk_gb * GB
+        self.reload_cooldown_s = reload_cooldown_s
+        self.max_conditional_epochs = max_conditional_epochs
+        self.prefetch_lead_s = prefetch_lead_s
         self.deadline_offset = lognormal_quantile(mean, sigma, quantile)
         self.rate = ObservedServiceRate(
             base,
@@ -847,7 +972,10 @@ class ServiceCurveEDFPolicy:
             poll_s=bandwidth_poll_s,
             window=bandwidth_window,
         ) if observe_bandwidth else None
+        self.hbm = ObservedHBMPressure(base, poll_s=hbm_poll_s) if observe_hbm else None
         self.last_rebalance = float("-inf")
+        self.last_reload_update = float("-inf")
+        self.reserve_active = False
         self.lock = threading.Lock()
         self.decision_lock = threading.Lock()
         self.waiting = {}
@@ -861,14 +989,69 @@ class ServiceCurveEDFPolicy:
             "planned_reload_bytes": 0,
             "planned_evict_bytes": 0,
             "curve_limited_bytes": 0,
+            "need_limited_bytes": 0,
             "peak_service_curve_utilization": 0.0,
             "waiting_samples": 0,
             "max_waiting": 0,
             "notify_rejections": 0,
+            "hbm_need_events": 0,
+            "hbm_need_bytes": 0,
+            "hbm_blocked_reload_bytes": 0,
+            "no_need_rebalances": 0,
+            "deadline_epoch_rolls": 0,
+            "predicted_allocation_peak_tokens": 0,
+            "reserve_activations": 0,
+            "opportunistic_reload_bytes": 0,
         }
 
     def _service_rate(self, now):
         return self.rate.update(now) if self.rate else self.shared_bytes_s
+
+    def _hbm_budget(self, now):
+        if self.hbm is None:
+            return math.inf, math.inf, None
+        sample = self.hbm.update(now)
+        if sample is None:
+            # Missing destination telemetry must never authorize new eviction.
+            return 0.0, math.inf, None
+        capacity = max(0.0, sample["capacity_tokens"])
+        available = max(0.0, sample["available_tokens"])
+        pending = max(0.0, sample["pending_prealloc_usage"]) * capacity
+        predicted = pending + max(0.0, sample["queued_requests"]) * (
+            self.queued_allocation_tokens
+        )
+        low = self.reserve_low * capacity
+        high = self.reserve_high * capacity
+        effective_available = available - predicted
+        if not self.reserve_active and effective_available < low:
+            self.reserve_active = True
+            with self.lock:
+                self.stats["reserve_activations"] += 1
+        elif self.reserve_active and effective_available >= high:
+            self.reserve_active = False
+        need_tokens = (
+            max(0.0, high - effective_available)
+            if self.reserve_active else 0.0
+        )
+        # Idle predictive Reload may intentionally consume the high-to-low
+        # band. The low watermark and real pending allocation remain protected.
+        headroom_tokens = max(0.0, effective_available - low)
+        with self.lock:
+            self.stats["predicted_allocation_peak_tokens"] = max(
+                self.stats["predicted_allocation_peak_tokens"], int(predicted)
+            )
+            if need_tokens > 0:
+                self.stats["hbm_need_events"] += 1
+                self.stats["hbm_need_bytes"] += int(
+                    need_tokens * self.bytes_per_token
+                )
+            else:
+                self.stats["no_need_rebalances"] += 1
+        return (
+            need_tokens * self.bytes_per_token,
+            headroom_tokens * self.bytes_per_token,
+            sample,
+        )
 
     def begin(self, session_id, ctx_tokens):
         now = time.monotonic()
@@ -877,11 +1060,12 @@ class ServiceCurveEDFPolicy:
             self.stats["calls"] += 1
             self.waiting[session_id] = {
                 "session_id": session_id,
+                "wait_started": now,
+                "conditional_epochs": 0,
                 "deadline": now + self.deadline_offset,
                 "total_bytes": total,
-                # A new wait offers its whole KV to the curve.  Once an update
-                # is accepted, max_missing is frozen to the applied amount;
-                # later rebalances may Reload it but cannot re-Evict it.
+                # The curve is only a safety ceiling. HBM pressure separately
+                # decides how much of this eligible range is actually evicted.
                 "committed_missing_bytes": 0.0,
                 "max_missing_bytes": float(total),
                 "applied_target_bytes": float(total),
@@ -910,38 +1094,127 @@ class ServiceCurveEDFPolicy:
             if not force and now - self.last_rebalance < self.interval:
                 return
             self.last_rebalance = now
+            eviction_need, hbm_headroom, hbm_sample = self._hbm_budget(now)
             with self.lock:
+                if eviction_need > 0:
+                    for live in self.waiting.values():
+                        if (
+                            live["applied_target_bytes"]
+                            >= live["total_bytes"] - 1.0
+                            and now >= live["deadline"]
+                            and live["conditional_epochs"]
+                            < self.max_conditional_epochs
+                        ):
+                            elapsed = max(0.0, now - live["wait_started"])
+                            live["deadline"] = now + conditional_quantile_remaining(
+                                elapsed,
+                                self.mean,
+                                self.sigma,
+                                self.quantile,
+                            )
+                            live["max_missing_bytes"] = live["total_bytes"]
+                            live["conditional_epochs"] += 1
+                            self.stats["deadline_epoch_rolls"] += 1
                 snapshot = {
                     session_id: dict(state)
                     for session_id, state in self.waiting.items()
                 }
             service_rate = self._service_rate(now)
+            curve_now = now + self.prefetch_lead_s
             utilization = service_curve_utilization(
-                snapshot, now, service_rate, self.safety
+                snapshot, curve_now, service_rate, self.safety
             )
             targets, _, _ = plan_service_curve_targets(
-                snapshot, now, service_rate, self.safety
+                snapshot,
+                curve_now,
+                service_rate,
+                self.safety,
+                eviction_need_bytes=eviction_need,
             )
+            reload_wanted = sum(
+                max(
+                    0.0,
+                    target - snapshot[session_id]["applied_target_bytes"],
+                )
+                for session_id, target in targets.items()
+            )
+            if hbm_headroom < reload_wanted:
+                targets, _, _ = plan_service_curve_targets(
+                    snapshot,
+                    curve_now,
+                    service_rate,
+                    self.safety,
+                    eviction_need_bytes=(
+                        eviction_need + reload_wanted - hbm_headroom
+                    ),
+                )
+            opportunistic_added = 0.0
+            if (
+                hbm_sample is not None
+                and not self.reserve_active
+                and eviction_need <= 0
+                and hbm_sample["pending_prealloc_usage"] <= 0
+                and hbm_sample["queued_requests"] <= 0
+            ):
+                mandatory_reload = sum(
+                    max(
+                        0.0,
+                        target
+                        - snapshot[session_id]["applied_target_bytes"],
+                    )
+                    for session_id, target in targets.items()
+                )
+                idle_budget = max(0.0, hbm_headroom - mandatory_reload)
+                for state in sorted(
+                    snapshot.values(),
+                    key=lambda item: (item["deadline"], item["session_id"]),
+                ):
+                    session_id = state["session_id"]
+                    before = targets[session_id]
+                    desired = min(
+                        state["total_bytes"],
+                        max(before, state["applied_target_bytes"])
+                        + idle_budget,
+                    )
+                    added = max(0.0, desired - before)
+                    targets[session_id] = desired
+                    idle_budget -= added
+                    opportunistic_added += added
+                    if idle_budget <= 1.0:
+                        break
             with self.lock:
                 self.stats["rebalances"] += 1
                 self.stats["waiting_samples"] += len(snapshot)
                 self.stats["peak_service_curve_utilization"] = max(
                     self.stats["peak_service_curve_utilization"], utilization
                 )
-                self.stats["curve_limited_bytes"] += int(sum(
+                eligible = sum(
                     max(
                         0.0,
                         state["max_missing_bytes"]
-                        - state["committed_missing_bytes"]
-                        - max(
-                            0.0,
-                            state["total_bytes"]
-                            - targets[session_id]
-                            - state["committed_missing_bytes"],
-                        ),
+                        - state["committed_missing_bytes"],
+                    )
+                    for state in snapshot.values()
+                )
+                offered = min(eligible, eviction_need)
+                admitted = sum(
+                    max(
+                        0.0,
+                        state["total_bytes"]
+                        - targets[session_id]
+                        - state["committed_missing_bytes"],
                     )
                     for session_id, state in snapshot.items()
-                ))
+                )
+                self.stats["curve_limited_bytes"] += int(
+                    max(0.0, offered - admitted)
+                )
+                self.stats["need_limited_bytes"] += int(
+                    max(0.0, eligible - offered)
+                )
+                self.stats["opportunistic_reload_bytes"] += int(
+                    opportunistic_added
+                )
 
             decreases = []
             increases = []
@@ -953,12 +1226,12 @@ class ServiceCurveEDFPolicy:
                 item = (state["deadline"], session_id, target, current)
                 (decreases if target < current else increases).append(item)
 
-            for _, session_id, target, current in (
-                sorted(decreases, reverse=True) + sorted(increases)
+            for _, session_id, target, current in sorted(
+                decreases, reverse=True
             ):
                 with self.lock:
                     if session_id not in self.waiting:
-                        break
+                        continue
                 state = snapshot[session_id]
                 accepted = notify_tool_probability(
                     self.base,
@@ -977,15 +1250,61 @@ class ServiceCurveEDFPolicy:
                         0.0, live["total_bytes"] - target
                     )
                     live["committed_missing_bytes"] = missing
+                    self.stats["target_updates"] += 1
+                    self.stats["evict_updates"] += 1
+                    self.stats["planned_evict_bytes"] += int(current - target)
+                    self.stats["full_evict_updates"] += int(target <= 1.0)
+                    hbm_headroom += current - target
+                    if self.hbm is not None:
+                        self.hbm.adjust_available_tokens(
+                            (current - target) / self.bytes_per_token
+                        )
+
+            for _, session_id, desired, current in sorted(increases):
+                if now - self.last_reload_update < self.reload_cooldown_s:
+                    break
+                target = min(
+                    desired,
+                    current + self.reload_chunk_bytes,
+                    current + hbm_headroom,
+                )
+                if target <= current + 1.0:
+                    with self.lock:
+                        self.stats["hbm_blocked_reload_bytes"] += int(
+                            desired - current
+                        )
+                    continue
+                with self.lock:
+                    if session_id not in self.waiting:
+                        continue
+                state = snapshot[session_id]
+                accepted = notify_tool_probability(
+                    self.base,
+                    session_id,
+                    min(1.0, max(0.0, target / state["total_bytes"])),
+                )
+                with self.lock:
+                    live = self.waiting.get(session_id)
+                    if not accepted:
+                        self.stats["notify_rejections"] += 1
+                        continue
+                    if live is None:
+                        continue
+                    live["applied_target_bytes"] = target
+                    missing = max(0.0, live["total_bytes"] - target)
+                    live["committed_missing_bytes"] = missing
+                    # Reloaded bytes cannot be re-Evicted in this deadline
+                    # epoch. A later conditional epoch can reopen eligibility.
                     live["max_missing_bytes"] = missing
                     self.stats["target_updates"] += 1
-                    if target < current:
-                        self.stats["evict_updates"] += 1
-                        self.stats["planned_evict_bytes"] += int(current - target)
-                        self.stats["full_evict_updates"] += int(target <= 1.0)
-                    else:
-                        self.stats["reload_updates"] += 1
-                        self.stats["planned_reload_bytes"] += int(target - current)
+                    self.stats["reload_updates"] += 1
+                    self.stats["planned_reload_bytes"] += int(target - current)
+                    hbm_headroom -= target - current
+                    self.last_reload_update = now
+                    if self.hbm is not None:
+                        self.hbm.adjust_available_tokens(
+                            -(target - current) / self.bytes_per_token
+                        )
         finally:
             self.decision_lock.release()
 
@@ -1006,8 +1325,14 @@ class ServiceCurveEDFPolicy:
         with self.lock:
             result = dict(self.stats)
             result.update(
-                version="9.0-service-curve-edf",
+                version="9.1-demand-gated-service-curve",
                 service_curve_safety=self.safety,
+                hbm_reserve_high=self.reserve_high,
+                hbm_reserve_low=self.reserve_low,
+                reload_chunk_bytes=self.reload_chunk_bytes,
+                reload_cooldown_s=self.reload_cooldown_s,
+                max_conditional_epochs=self.max_conditional_epochs,
+                prefetch_lead_s=self.prefetch_lead_s,
                 waiting_at_end=len(self.waiting),
             )
             result["service_rate"] = (
@@ -1017,6 +1342,9 @@ class ServiceCurveEDFPolicy:
                     "observed_samples": 0,
                     "sample_errors": 0,
                 }
+            )
+            result["hbm_pressure"] = (
+                self.hbm.snapshot() if self.hbm else None
             )
         return result
 
@@ -1777,10 +2105,21 @@ def main():
     p.add_argument("--shared-bandwidth-gbps", type=float, default=8.0,
                    help="Conservative ceiling for aggregate H2D service")
     p.add_argument("--service-curve-safety", type=float, default=0.9)
+    p.add_argument("--service-curve-interval", type=float, default=0.1)
     p.add_argument("--service-bandwidth-poll-s", type=float, default=0.5)
     p.add_argument("--service-bandwidth-window", type=int, default=5)
     p.add_argument("--no-service-bandwidth-observation", action="store_true",
                    help="Use the configured service ceiling without telemetry")
+    p.add_argument("--service-hbm-poll-s", type=float, default=0.1)
+    p.add_argument("--service-hbm-reserve-low", type=float, default=0.05)
+    p.add_argument("--service-hbm-reserve-high", type=float, default=0.30)
+    p.add_argument("--service-queued-allocation-tokens", type=int, default=1024)
+    p.add_argument("--service-reload-chunk-gb", type=float, default=0.5)
+    p.add_argument("--service-reload-cooldown-s", type=float, default=0.2)
+    p.add_argument("--service-max-conditional-epochs", type=int, default=2)
+    p.add_argument("--service-prefetch-lead-s", type=float, default=1.0)
+    p.add_argument("--no-service-hbm-observation", action="store_true",
+                   help="Disable demand-gating HBM telemetry")
     p.add_argument("--selective-shedding", action="store_true",
                    help="Shed only deadline-infeasible tool waits")
     p.add_argument("--shedding-capacity-gbps", type=float, default=4.0,
@@ -1849,8 +2188,25 @@ def main():
         p.error("--shared-bandwidth-gbps must be positive")
     if not 0.0 < a.service_curve_safety <= 1.0:
         p.error("--service-curve-safety must be in (0, 1]")
+    if a.service_curve_interval <= 0:
+        p.error("--service-curve-interval must be positive")
     if a.service_bandwidth_poll_s <= 0 or a.service_bandwidth_window <= 0:
         p.error("service-bandwidth observation parameters must be positive")
+    if a.service_hbm_poll_s <= 0:
+        p.error("--service-hbm-poll-s must be positive")
+    if not (
+        0.0 <= a.service_hbm_reserve_low
+        < a.service_hbm_reserve_high < 1.0
+    ):
+        p.error("service HBM reserves must satisfy 0 <= low < high < 1")
+    if (
+        a.service_queued_allocation_tokens < 0
+        or a.service_reload_chunk_gb <= 0
+        or a.service_reload_cooldown_s <= 0
+        or a.service_max_conditional_epochs < 0
+        or a.service_prefetch_lead_s < 0
+    ):
+        p.error("service allocation prediction and Reload chunk are invalid")
     if a.shedding_capacity_gbps <= 0:
         p.error("--shedding-capacity-gbps must be positive")
     if not 0.0 <= a.shedding_max_fraction < 1.0:
@@ -2008,12 +2364,21 @@ def main():
             sigma=a.tool_sigma,
             bytes_per_token=b,
             shared_gbps=a.shared_bandwidth_gbps,
-            interval=a.probability_update_interval,
+            interval=a.service_curve_interval,
             quantile=a.deadline_quantile,
             safety=a.service_curve_safety,
             observe_bandwidth=not a.no_service_bandwidth_observation,
             bandwidth_poll_s=a.service_bandwidth_poll_s,
             bandwidth_window=a.service_bandwidth_window,
+            observe_hbm=not a.no_service_hbm_observation,
+            hbm_poll_s=a.service_hbm_poll_s,
+            reserve_low=a.service_hbm_reserve_low,
+            reserve_high=a.service_hbm_reserve_high,
+            queued_allocation_tokens=a.service_queued_allocation_tokens,
+            reload_chunk_gb=a.service_reload_chunk_gb,
+            reload_cooldown_s=a.service_reload_cooldown_s,
+            max_conditional_epochs=a.service_max_conditional_epochs,
+            prefetch_lead_s=a.service_prefetch_lead_s,
         )
     if a.pressure_eviction:
         pressure = PressureEvictionDeadlinePolicy(
