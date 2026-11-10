@@ -1,0 +1,3292 @@
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 3258cfb9e9746daf86cb886c445e1d015fe2526d..4651690bbb957fa39a13a0440a5a512a3fc4a332 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -148,6 +148,7 @@ from sglang.srt.managers.io_struct import (
+     SeparateReasoningReqInput,
+     SetInternalStateReq,
+     SlowDownReqInput,
++    ToolCacheProbabilityReq,
+     UnloadLoRAAdapterReqInput,
+     UpdateWeightFromDiskReqInput,
+     UpdateWeightsFromDistributedReqInput,
+@@ -1649,6 +1650,19 @@ async def close_session(obj: Annotated[CloseSessionReqInput, Body()], request: R
+         return _create_error_response(e)
+ 
+ 
++@app.post("/tool_cache_probability", status_code=202)
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def update_tool_cache_probability(
++    obj: Annotated[ToolCacheProbabilityReq, Body()], request: Request
++):
++    """Adjust one waiting tool session's HBM target without waiting for its return."""
++    try:
++        await _global_state.tokenizer_manager.update_tool_cache_probability(obj)
++        return {"accepted": True}
++    except Exception as e:
++        return _create_error_response(e)
++
++
+ @app.api_route("/configure_logging", methods=["GET", "POST"])
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+ async def configure_logging(
+diff --git a/python/sglang/srt/managers/cache_controller.py b/python/sglang/srt/managers/cache_controller.py
+index 115720b06fe0c94dc8739c1fc3c97e88449335cc..e8b9e5148e30aa73f8e5b33c04a5331ff2e59233 100644
+--- a/python/sglang/srt/managers/cache_controller.py
++++ b/python/sglang/srt/managers/cache_controller.py
+@@ -14,7 +14,9 @@ limitations under the License.
+ """
+ 
+ 
++import json
+ import logging
++import os
+ import threading
+ import time
+ from dataclasses import dataclass
+@@ -184,6 +186,7 @@ class HiCacheAck(NamedTuple):
+     # Total bytes moved by the op across all pools, including draft piggyback
+     # and sidecar transfers that the per-pool token counts exclude.
+     num_bytes: int = 0
++    reload_trace_ids: Optional[List[str]] = None
+ 
+ 
+ @dataclass
+@@ -323,6 +326,20 @@ class HiCacheController:
+         self.storage_backend = None
+         self.storage_backend_type = None
+         self.enable_storage_metrics = enable_storage_metrics
++        trace_path = os.environ.get("SGLANG_RELOAD_TRACE_PATH")
++        if trace_path:
++            from sglang.srt.observability.reload_trace import ReloadTrace
++
++            self.reload_trace = ReloadTrace(f"{trace_path}.{os.getpid()}.jsonl")
++        else:
++            self.reload_trace = None
++        self.transfer_journal = None
++        if os.environ.get("SGLANG_V7_TRANSFER_JOURNAL") == "1":
++            from sglang.srt.observability.transfer_journal import TransferJournal
++
++            self.transfer_journal = TransferJournal(
++                lambda event: logger.info("kv-transfer journal: %s", json.dumps(event))
++            )
+         # Buffer mode: wired by the tree cache after attach; the load rate
+         # limiter subtracts write staging from actual pool usage.
+         self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
+@@ -754,6 +771,8 @@ class HiCacheController:
+         # storage thread remains alive before clearing shared state.
+         self._stop_storage_threads()
+ 
++        if self.transfer_journal is not None:
++            self.transfer_journal.reset()
+         self.write_queue.clear()
+         self.load_queue.clear()
+         self.ack_write_queue.clear()
+@@ -849,6 +868,18 @@ class HiCacheController:
+     def _num_tokens_by_pool(self, op: CacheOperation) -> dict[str, int]:
+         return {PoolName.KV.value: len(op.device_indices)}
+ 
++    def _enqueue_load_operation(self, op: CacheOperation):
++        """Shared base/hybrid entry after successful device allocation."""
++        self.load_queue.append(op)
++        if self.transfer_journal is not None:
++            self.transfer_journal.enqueue(
++                str(op.id), len(op.device_indices), self._transfer_num_bytes(op)
++            )
++        if self.reload_trace is not None:
++            self.reload_trace.emit(
++                "enqueue", "l2_to_hbm", str(op.id), bytes=self._transfer_num_bytes(op)
++            )
++
+     def load(
+         self,
+         host_indices: torch.Tensor,
+@@ -861,9 +892,8 @@ class HiCacheController:
+         device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
+         if device_indices is None:
+             return None
+-        self.load_queue.append(
+-            CacheOperation(host_indices, device_indices, node_id, priority)
+-        )
++        op = CacheOperation(host_indices, device_indices, node_id, priority)
++        self._enqueue_load_operation(op)
+         return device_indices
+ 
+     def move_indices(
+@@ -953,10 +983,14 @@ class HiCacheController:
+         if len(self.load_queue) == 0:
+             return -1
+ 
++        trace_ids = [str(item.id) for item in self.load_queue]
+         producer_id = self.layer_done_counter.update_producer()
+         op = CacheOperation.merge_ops(self.load_queue)
+         host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+         self.load_queue.clear()
++        if self.reload_trace is not None:
++            for trace_id in trace_ids:
++                self.reload_trace.emit("start", "l2_to_hbm", trace_id)
+         producer_event = self.layer_done_counter.events[producer_id]
+         producer_event.start_event.record()
+ 
+@@ -984,10 +1018,32 @@ class HiCacheController:
+                 timing_enabled=completion.timing_enabled,
+                 num_tokens_by_pool=self._num_tokens_by_pool(op),
+                 num_bytes=self._transfer_num_bytes(op),
++                reload_trace_ids=trace_ids,
+             )
+         )
++        if self.transfer_journal is not None:
++            self.transfer_journal.submit(trace_ids)
+         return producer_id
+ 
++    def can_start_loading(self, reserve: int = 0) -> bool:
++        """Whether the next H2D producer slot is no longer in flight.
++
++        ``reserve`` additionally requires that many slots *after* the next one
++        be free. A proactive producer must pass ``reserve >= 1``: the prefill
++        path in ``_get_new_batch_prefill_raw`` calls
++        ``ready_to_load_host_cache`` unguarded (it has a batch to serve and
++        cannot decline), so if a background producer consumes the slot the
++        request path needs, ``update_producer`` asserts there instead. With
++        ``num_counters == 3``, a reserve of 1 keeps one slot for requests.
++        """
++        counter = self.layer_done_counter
++        total = len(counter.events)
++        for step in range(1 + max(0, reserve)):
++            index = (counter.producer_index + 1 + step) % total
++            if not counter.events[index].finish_event.query():
++                return False
++        return True
++
+     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
+         if not backup_only:
+             raise ValueError("Other eviction policies are not supported yet.")
+@@ -1166,7 +1222,21 @@ class HiCacheController:
+                 operation = self.prefetch_buffer.get(block=True, timeout=1)
+                 if operation is None:
+                     continue
++                if self.reload_trace is not None:
++                    self.reload_trace.emit(
++                        "start",
++                        "l3_to_l2",
++                        str(operation.id),
++                        instance_id=operation.request_id,
++                    )
+                 self._page_transfer(operation)
++                if self.reload_trace is not None:
++                    self.reload_trace.emit(
++                        "finish",
++                        "l3_to_l2",
++                        str(operation.id),
++                        instance_id=operation.request_id,
++                    )
+ 
+                 self.prefetch_sync_queue.put(
+                     PrefetchAck(
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 9629b7aab6219c21f330937a1657f836e675ee9d..28630a242ef47c695f8004293440a36eadedeb15 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -2320,6 +2320,15 @@ class CloseSessionReqInput(BaseReq, kw_only=True):
+     session_id: str
+ 
+ 
++class ToolCacheProbabilityReq(BaseReq, kw_only=True):
++    """Update the current tool-return probability for one radix session."""
++
++    session_id: str
++    return_probability: float
++    two_phase_action: Optional[str] = None
++    deadline_seconds: Optional[float] = None
++
++
+ class OpenSessionReqOutput(BaseReq, kw_only=True):
+     session_id: Optional[str]
+     success: bool
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index a7d8baeecc37b09a6d09ffb0493526b993f3ac43..3619430660c9f9232818341625b8ccd1b056e87a 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -15,6 +15,7 @@
+ 
+ import dataclasses
+ import faulthandler
++import json
+ import logging
+ import math
+ import os
+@@ -180,6 +181,7 @@ from sglang.srt.managers.io_struct import (
+     SlowDownReqOutput,
+     TokenizedEmbeddingReqInput,
+     TokenizedGenerateReqInput,
++    ToolCacheProbabilityReq,
+     UnloadLoRAAdapterReqInput,
+     UnloadLoRAAdapterReqOutput,
+     UpdateWeightFromDiskReqInput,
+@@ -597,6 +599,16 @@ class Scheduler(
+         )
+         self.disable_radix_cache = result.disable_radix_cache
+         self.tree_cache = result.tree_cache
++        pressure_interval = os.environ.get("SGLANG_V7_PRESSURE_SAMPLE_S")
++        self.v7_pressure_sampler = None
++        if pressure_interval is not None:
++            from sglang.srt.mem_cache.joint_policy.pressure_telemetry import (
++                PressureSampler,
++            )
++
++            if not hasattr(self.tree_cache, "ongoing_load_back"):
++                raise ValueError("v7 pressure sampling requires UnifiedRadixCache")
++            self.v7_pressure_sampler = PressureSampler(float(pressure_interval))
+         if self.enable_hierarchical_cache:
+             cache_controller = self.tree_cache.cache_controller
+             if cache_controller is not None:
+@@ -1729,6 +1741,10 @@ class Scheduler(
+                 (AbortReq, self.abort_request),
+                 (OpenSessionReqInput, self.open_session),
+                 (CloseSessionReqInput, self.close_session),
++                (
++                    ToolCacheProbabilityReq,
++                    self.update_tool_cache_probability,
++                ),
+                 (
+                     UpdateWeightFromDiskReqInput,
+                     self.weight_updater.update_weights_from_disk,
+@@ -2077,6 +2093,28 @@ class Scheduler(
+         if recv_reqs:
+             self.metrics_reporter.record_scheduler_active()
+         self.process_input_requests(recv_reqs)
++        if self.v7_pressure_sampler is not None:
++            sample = self.v7_pressure_sampler.maybe_sample(
++                self.tree_cache,
++                len(self.waiting_queue),
++                (req.time_stats.wait_queue_entry_time for req in self.waiting_queue),
++            )
++            if sample is not None:
++                logger.info("kv-pressure sample: %s", json.dumps(sample, sort_keys=True))
++        if getattr(self.tree_cache, "probability_reload_foreground_first", False):
++            self.tree_cache.probability_foreground_pending = bool(self.waiting_queue)
++        if getattr(self.tree_cache, "deadline_floor_enabled", False):
++            # Strong idle includes running/waiting work, overlap results and all
++            # HiCache transfers.  v8.1 reserve eviction must never compete with
++            # foreground execution or another cache operation.
++            self.tree_cache.deadline_floor_scheduler_idle = self.is_fully_idle()
++        batch_flusher = getattr(
++            self.tree_cache, "flush_probability_reload_batch", None
++        )
++        if batch_flusher is not None:
++            flush_result = batch_flusher()
++            if flush_result is not None:
++                logger.info("tool-cache reload batch flush: %s", flush_result)
+         return recv_reqs
+ 
+     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
+@@ -3991,6 +4029,10 @@ class Scheduler(
+                     req.cache_request_handle
+                 )
+                 if not prefetch_done:
++                    if self.v7_pressure_sampler is not None:
++                        self.v7_pressure_sampler.record_prefill_defer(
++                            "prefetch_pending"
++                        )
+                     # skip staging requests that are ongoing prefetch
+                     continue
+                 # Pop the L3-loaded span. Unified cache exposes its absolute
+@@ -4043,6 +4085,12 @@ class Scheduler(
+                 # pre-existing from a session). Session-held slots have their own
+                 # lifecycle and freeing them here causes double-free.
+                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
++                if (
++                    res == AddReqResult.NO_TOKEN
++                    and not added
++                    and self.v7_pressure_sampler is not None
++                ):
++                    self.v7_pressure_sampler.record_prefill_defer("no_token")
+                 if not added:
+                     # init_next_round_input() may stage deferred Mamba COW/clear
+                     # metadata before add_one_req() rejects the request.
+@@ -4068,6 +4116,14 @@ class Scheduler(
+         if self.enable_hicache_storage and retries is not None:
+             for req in can_run_list:
+                 retries.cancel(req.rid)
++        if self.v7_pressure_sampler is not None:
++            queue_event = self.v7_pressure_sampler.admitted_queue_intervals(
++                req.time_stats.wait_queue_entry_time
++                for req in self.waiting_queue if req in can_run_set
++            )
++            if queue_event["admitted_episodes"]:
++                logger.info("kv-pressure queue-admission: %s",
++                            json.dumps(queue_event, sort_keys=True))
+         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+         if adder.preempt_list:
+             for req in adder.preempt_list:
+@@ -5880,6 +5936,24 @@ class Scheduler(
+         ):
+             self.session_controller.close(recv_req)
+ 
++    def update_tool_cache_probability(self, recv_req: ToolCacheProbabilityReq):
++        if getattr(self.tree_cache, "probability_reload_foreground_first", False):
++            self.tree_cache.probability_foreground_pending = bool(self.waiting_queue)
++        updater = getattr(self.tree_cache, "set_tool_return_probability", None)
++        if updater is None:
++            logger.warning("Tool-cache probability update requires UnifiedRadixCache")
++            return
++        if recv_req.two_phase_action is not None:
++            result = self.tree_cache.update_two_phase(
++                recv_req.session_id, recv_req.two_phase_action, recv_req.deadline_seconds
++            )
++        else:
++            result = updater(recv_req.session_id, recv_req.return_probability)
++        if result.get("applied") and result.get("action") != "none":
++            logger.info("tool-cache probability update: %s", result)
++        else:
++            logger.debug("tool-cache probability update: %s", result)
++
+     def maybe_sleep_on_idle(self):
+         if self.idle_sleeper is not None:
+             self.idle_sleeper.maybe_sleep()
+diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
+index f5051295bd33862aa5e9651634d32f9b98bb04cd..f279cc7f8b2e1492b85deb8ae3742754c4842806 100644
+--- a/python/sglang/srt/managers/tokenizer_control_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
+@@ -71,6 +71,7 @@ from sglang.srt.managers.io_struct import (
+     SetInternalStateReqOutput,
+     SlowDownReqInput,
+     SlowDownReqOutput,
++    ToolCacheProbabilityReq,
+     UnloadLoRAAdapterReqInput,
+     UnloadLoRAAdapterReqOutput,
+     UpdateWeightsFromDistributedReqInput,
+@@ -1037,6 +1038,28 @@ class TokenizerControlMixin:
+     ):
+         await self._async_dispatch_to_scheduler(obj)
+ 
++    async def update_tool_cache_probability(
++        self: TokenizerManager, obj: ToolCacheProbabilityReq
++    ) -> None:
++        if not 0.0 <= obj.return_probability <= 1.0:
++            raise ValueError("return_probability must be in [0, 1]")
++        if obj.two_phase_action is not None:
++            import math
++            import os
++            if not (
++                os.getenv("SGLANG_TWO_PHASE_PRESSURE", "0") == "1"
++                or os.getenv("SGLANG_DEADLINE_FLOOR", "0") == "1"
++            ):
++                raise ValueError("deadline policy runtime is disabled")
++            if obj.two_phase_action not in {"begin", "poll", "end"}:
++                raise ValueError("invalid two_phase_action")
++            if obj.two_phase_action == "begin" and (
++                obj.deadline_seconds is None or not math.isfinite(obj.deadline_seconds)
++                or not 0 < obj.deadline_seconds <= 3600
++            ):
++                raise ValueError("deadline_seconds must be within (0, 3600]")
++        await self._async_dispatch_to_scheduler(obj)
++
+     async def update_weight_version(
+         self: TokenizerManager, obj: UpdateWeightVersionReqInput
+     ) -> None:
+diff --git a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
+index 89482ce48c8b8bbe683e6c5a2d80d87431a89ad4..0ce4106b8fcb04a74d324570f3f27efcda5c8276 100644
+--- a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
++++ b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
+@@ -831,15 +831,14 @@ class HybridCacheController(BaseHiCacheController):
+                 full_allocator.free(device_indices)
+             return None
+ 
+-        self.load_queue.append(
+-            CacheOperation(
+-                host_indices,
+-                device_indices,
+-                node_id,
+-                priority,
+-                pool_transfers=pool_transfers or None,
+-            )
++        op = CacheOperation(
++            host_indices,
++            device_indices,
++            node_id,
++            priority,
++            pool_transfers=pool_transfers or None,
+         )
++        self._enqueue_load_operation(op)
+         return device_indices
+ 
+     def prefetch(
+diff --git a/python/sglang/srt/mem_cache/joint_policy/__init__.py b/python/sglang/srt/mem_cache/joint_policy/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce5dc6271b1d8f26e6fafc4c05bdfda225fb1207
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/joint_policy/__init__.py
+@@ -0,0 +1,19 @@
++"""Experimental joint cache-placement policies."""
++
++from sglang.srt.mem_cache.joint_policy.probability_residency import (
++    ProbabilityResidencyDecision,
++    ReloadMicrobatchState,
++    decide_probability_residency,
++)
++from sglang.srt.mem_cache.joint_policy.residency_invariants import (
++    NodeResidency,
++    find_residency_contiguity_violations,
++)
++
++__all__ = [
++    "NodeResidency",
++    "ProbabilityResidencyDecision",
++    "ReloadMicrobatchState",
++    "decide_probability_residency",
++    "find_residency_contiguity_violations",
++]
+diff --git a/python/sglang/srt/mem_cache/joint_policy/deadline_floor.py b/python/sglang/srt/mem_cache/joint_policy/deadline_floor.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1b794d3acf26720833e434ff07f3d1103c6dd404
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/joint_policy/deadline_floor.py
+@@ -0,0 +1,352 @@
++"""Deadline residency floors with an idle-only global reserve watermark.
++
++The controller never demotes cache merely because time or utilization crossed a
++threshold.  It uses the v6 fluid-link feasibility model for two operations:
++
++* without an allocator shortfall, reload only the minimum EDF repair needed to
++  keep all registered sessions feasible at the next control horizon;
++* while the scheduler and cache-transfer pipeline are fully idle, reclaim a
++  bounded far-deadline suffix to restore allocator headroom;
++* with a real allocator shortfall, reclaim far-deadline suffixes immediately
++  without making the registered deadline set infeasible.
++
++Rates are configured as sustainable token rates and multiplied by an explicit
++safety factor (0.9 by default).  Units are allocator tokens and monotonic time.
++"""
++
++from __future__ import annotations
++
++import logging
++import math
++import os
++import time
++
++from sglang.srt.mem_cache.joint_policy.two_phase import (
++    Job,
++    feasible,
++    plan_evict,
++    reload_targets,
++)
++
++logger = logging.getLogger(__name__)
++
++
++class DeadlineFloorController:
++    """Maintain EDF floors plus a hysteretic, idle-only allocator reserve."""
++
++    def __init__(self, cache):
++        import torch
++
++        if (
++            torch.distributed.is_initialized()
++            and torch.distributed.get_world_size() > 1
++        ):
++            raise ValueError("deadline-floor currently supports one GPU/rank only")
++        from sglang.srt.mem_cache.unified_cache.components import ComponentType
++
++        if list(cache.tree_components) != [ComponentType.FULL]:
++            raise ValueError("deadline-floor supports Full KV only")
++        if not cache.enable_session_radix_cache or cache.cache_controller is None:
++            raise ValueError("deadline-floor requires session radix cache and HiCache")
++
++        self.cache = cache
++        self.deadlines: dict[str, float] = {}
++        self.last_tick = 0.0
++        self.interval = float(os.getenv("SGLANG_DEADLINE_FLOOR_INTERVAL", "0.05"))
++        self.shared = float(os.getenv("SGLANG_DEADLINE_FLOOR_SHARED_TOKENS_S", "80000"))
++        self.per_session = float(
++            os.getenv("SGLANG_DEADLINE_FLOOR_SESSION_TOKENS_S", "10000")
++        )
++        self.safety = float(os.getenv("SGLANG_DEADLINE_FLOOR_SAFETY", "0.9"))
++        self.reserve_low = float(
++            os.getenv("SGLANG_DEADLINE_FLOOR_RESERVE_LOW", "0.10")
++        )
++        self.reserve_high = float(
++            os.getenv("SGLANG_DEADLINE_FLOOR_RESERVE_HIGH", "0.15")
++        )
++        self.reserve_step = float(
++            os.getenv("SGLANG_DEADLINE_FLOOR_RESERVE_STEP", "0.02")
++        )
++        self.reserve_cooldown = float(
++            os.getenv("SGLANG_DEADLINE_FLOOR_RESERVE_COOLDOWN", "0.5")
++        )
++        self.idle_grace = float(
++            os.getenv("SGLANG_DEADLINE_FLOOR_IDLE_GRACE", "0.1")
++        )
++        self.reserve_active = False
++        self.idle_since: float | None = None
++        self.last_reserve = float("-inf")
++        self.busy = False
++        self.last_decision: dict[str, object] = {}
++        if (
++            not all(
++                math.isfinite(v) and v > 0
++                for v in (self.shared, self.per_session, self.interval)
++            )
++            or not math.isfinite(self.safety)
++            or not 0 < self.safety <= 1
++            or not all(
++                math.isfinite(v)
++                for v in (
++                    self.reserve_low,
++                    self.reserve_high,
++                    self.reserve_step,
++                    self.reserve_cooldown,
++                    self.idle_grace,
++                )
++            )
++            or not 0 <= self.reserve_low < self.reserve_high < 1
++            or not 0 < self.reserve_step <= self.reserve_high
++            or self.reserve_cooldown < 0
++            or self.idle_grace < 0
++        ):
++            raise ValueError("invalid deadline-floor configuration")
++
++    @property
++    def budget_shared(self) -> float:
++        return self.shared * self.safety
++
++    @property
++    def budget_per_session(self) -> float:
++        return self.per_session * self.safety
++
++    def update(self, sid, action, seconds):
++        if action == "begin":
++            if seconds is None or not math.isfinite(seconds) or not 0 < seconds <= 3600:
++                raise ValueError("deadline_seconds must be within (0, 3600]")
++            if sid not in self.deadlines:
++                self.deadlines[sid] = time.monotonic() + seconds
++            # A floor is a lower bound, never a command to demote on entry.
++            # The scheduler already ticks this controller every loop.  Keep the
++            # control-plane request O(1): synchronously snapshotting every
++            # registered radix path here stalls foreground scheduling even when
++            # the cache is fully resident and no floor repair is necessary.
++            return {"applied": True, "action": "none", "registered": True}
++        elif action == "end":
++            self.deadlines.pop(sid, None)
++            return self.cache.set_tool_return_probability(sid, 1.0)
++        elif action != "poll":
++            raise ValueError("invalid deadline-floor action")
++        self.tick()
++        return {"applied": True, "action": "deadline_floor", **self.last_decision}
++
++    def snapshot(self):
++        cache = self.cache
++        from sglang.srt.mem_cache.unified_cache.components import ComponentType
++
++        full = ComponentType.FULL
++        paths = {sid: cache._session_full_path(sid) for sid in self.deadlines}
++        counts: dict[int, int] = {}
++        for path in paths.values():
++            for node in path:
++                counts[node.id] = counts.get(node.id, 0) + 1
++
++        jobs = []
++        for sid, path in paths.items():
++            if not path:
++                continue
++            total = sum(len(node.key) for node in path)
++            resident = sum(
++                len(node.key)
++                for node in path
++                if node.component_data[full].value is not None
++            )
++            reclaimable = 0
++            for node in reversed(path):
++                component = node.component_data[full]
++                if component.value is None:
++                    continue
++                if (
++                    counts[node.id] > 1
++                    or component.host_value is None
++                    or node.write_through_pending_id is not None
++                    or any(data.lock_ref > 0 for data in node.component_data)
++                ):
++                    break
++                if any(child not in path for child in node.children.values()):
++                    break
++                reclaimable += len(node.key)
++            host_ready = all(
++                node.component_data[full].host_value is not None
++                and node.write_through_pending_id is None
++                for node in path
++                if node.component_data[full].value is None
++            )
++            jobs.append(
++                Job(
++                    sid,
++                    self.deadlines[sid],
++                    total,
++                    resident,
++                    reclaimable,
++                    host_ready,
++                )
++            )
++        return jobs
++
++    def tick(self, shortfall=0):
++        """Apply one floor repair, idle reserve step, or demand reclaim."""
++        if shortfall < 0:
++            raise ValueError("shortfall must be non-negative")
++        if self.busy:
++            return 0
++        now = time.monotonic()
++        scheduler_idle = bool(
++            getattr(self.cache, "deadline_floor_scheduler_idle", False)
++        )
++        if not shortfall:
++            if scheduler_idle:
++                if self.idle_since is None:
++                    self.idle_since = now
++            else:
++                self.idle_since = None
++        if not shortfall and now - self.last_tick < self.interval:
++            return 0
++
++        self.busy = True
++        try:
++            self.last_tick = now
++            cache = self.cache
++            if cache.ongoing_load_back:
++                self.last_decision = {
++                    "mode": "DEMAND" if shortfall else "FLOOR",
++                    "deferred": "h2d_inflight",
++                    "shortfall_tokens": shortfall,
++                }
++                return 0
++
++            jobs = self.snapshot()
++            page = cache.page_size
++            allocator = cache.token_to_kv_pool_allocator
++            capacity = allocator.size_full
++            available = cache._component_available_size(cache.tree_components[0])
++            if not 0 < capacity or not 0 <= available <= capacity:
++                raise ValueError("invalid deadline-floor allocator accounting")
++            horizon_now = now + self.interval * 2
++            missing = {job.sid: job.total - job.resident for job in jobs}
++            model_feasible = feasible(
++                jobs,
++                missing,
++                horizon_now,
++                self.budget_shared,
++                self.budget_per_session,
++            )
++            freed = 0
++            reductions: dict[str, int] = {}
++            targets: dict[str, int] = {}
++            reserve_requested = 0
++            reserve_deferred = None
++
++            low_tokens = math.ceil(self.reserve_low * capacity / page) * page
++            high_tokens = math.ceil(self.reserve_high * capacity / page) * page
++            if available >= high_tokens:
++                self.reserve_active = False
++            elif available < low_tokens:
++                self.reserve_active = True
++
++            if not shortfall and self.reserve_active:
++                if not scheduler_idle:
++                    reserve_deferred = "scheduler_busy"
++                elif self.idle_since is None or now - self.idle_since < self.idle_grace:
++                    reserve_deferred = "idle_grace"
++                elif now - self.last_reserve < self.reserve_cooldown:
++                    reserve_deferred = "cooldown"
++                elif available < high_tokens:
++                    step_tokens = max(
++                        page,
++                        math.ceil(self.reserve_step * capacity / page) * page,
++                    )
++                    reserve_requested = min(high_tokens - available, step_tokens)
++
++            if shortfall and model_feasible:
++                limit = math.ceil(shortfall / page) * page
++                reductions, _, model_feasible = plan_evict(
++                    jobs,
++                    horizon_now,
++                    self.budget_shared,
++                    self.budget_per_session,
++                    limit,
++                    page,
++                )
++                before = cache._component_available_size(cache.tree_components[0])
++                for job in sorted(jobs, key=lambda item: item.deadline, reverse=True):
++                    amount = reductions.get(job.sid, 0)
++                    if amount:
++                        cache.set_tool_return_probability(
++                            job.sid, (job.resident - amount) / job.total
++                        )
++                after = cache._component_available_size(cache.tree_components[0])
++                freed = max(0, after - before)
++            elif reserve_requested and model_feasible:
++                limit = math.ceil(reserve_requested / page) * page
++                reductions, _, model_feasible = plan_evict(
++                    jobs,
++                    horizon_now,
++                    self.budget_shared,
++                    self.budget_per_session,
++                    limit,
++                    page,
++                )
++                before = available
++                for job in sorted(jobs, key=lambda item: item.deadline, reverse=True):
++                    amount = reductions.get(job.sid, 0)
++                    if amount:
++                        cache.set_tool_return_probability(
++                            job.sid, (job.resident - amount) / job.total
++                        )
++                after = cache._component_available_size(cache.tree_components[0])
++                freed = max(0, after - before)
++                if freed:
++                    self.last_reserve = now
++                if after >= high_tokens:
++                    self.reserve_active = False
++            elif not shortfall:
++                targets = reload_targets(
++                    jobs,
++                    now,
++                    self.budget_shared,
++                    self.budget_per_session,
++                    self.interval * 2,
++                    page,
++                )
++                for job in sorted(jobs, key=lambda item: item.deadline):
++                    target = targets.get(job.sid)
++                    if target is not None and target > job.resident:
++                        cache.set_tool_return_probability(job.sid, target / job.total)
++
++            self.last_decision = {
++                "version": "8.1-idle-reserve",
++                "mode": (
++                    "DEMAND"
++                    if shortfall
++                    else "IDLE_RESERVE"
++                    if reserve_requested
++                    else "FLOOR"
++                ),
++                "shortfall_tokens": shortfall,
++                "capacity_tokens": capacity,
++                "available_tokens_before": available,
++                "reserve_low_tokens": low_tokens,
++                "reserve_high_tokens": high_tokens,
++                "reserve_active": self.reserve_active,
++                "reserve_requested_tokens": reserve_requested,
++                "reserve_deferred": reserve_deferred,
++                "planned_evict_tokens": sum(reductions.values()),
++                "planned_reload_tokens": sum(
++                    max(0, targets.get(job.sid, job.resident) - job.resident)
++                    for job in jobs
++                ),
++                "freed_tokens": freed,
++                "model_feasible": model_feasible,
++                "safety": self.safety,
++            }
++            if (
++                shortfall
++                or reductions
++                or targets
++                or not model_feasible
++            ):
++                logger.info("deadline-floor decision: %s", self.last_decision)
++            return freed
++        finally:
++            self.busy = False
+diff --git a/python/sglang/srt/mem_cache/joint_policy/pressure_telemetry.py b/python/sglang/srt/mem_cache/joint_policy/pressure_telemetry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5ba0343354d02f0b970315f03e6cba90c9ac2827
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/joint_policy/pressure_telemetry.py
+@@ -0,0 +1,117 @@
++"""Optional, time-based KV pool observations for pressure-policy experiments."""
++
++import math
++import time
++
++
++class PressureSampler:
++    def __init__(self, interval_s, clock=time.monotonic, queue_clock=time.perf_counter):
++        if not 0 < interval_s <= 60:
++            raise ValueError("pressure sample interval must be in (0, 60] seconds")
++        self.interval_s = interval_s
++        self.clock = clock
++        self.queue_clock = queue_clock
++        self.next_due = None
++        self.last_sample = None
++        self.no_token_attempts = 0
++        self.prefetch_pending_attempts = 0
++
++    def record_prefill_defer(self, reason):
++        if reason == "no_token":
++            self.no_token_attempts += 1
++        elif reason == "prefetch_pending":
++            self.prefetch_pending_attempts += 1
++        else:
++            raise ValueError("unknown prefill defer reason")
++
++    def admitted_queue_intervals(self, entry_times):
++        """Completed waiting episodes, independent of the periodic sample gate.
++
++        Only requests removed from waiting_queue for prefill admission belong
++        here. Chunk continuations, aborts and still-waiting requests do not.
++        Both endpoints use perf_counter; never join these with monotonic_s.
++        """
++        now = self.queue_clock()
++        entries = list(entry_times)
++        valid = [entry for entry in entries
++                 if math.isfinite(entry) and 0 < entry <= now]
++        return {
++            "queue_clock_s": now,
++            "entry_times_s": valid,
++            "admitted_episodes": len(entries),
++            "invalid_entry_times": len(entries) - len(valid),
++        }
++
++    def maybe_sample(self, cache, waiting_requests, waiting_entry_times=()):
++        now = self.clock()
++        if self.last_sample is not None and now < self.last_sample:
++            raise ValueError("monotonic clock moved backward")
++        if self.next_due is not None and now < self.next_due:
++            return None
++
++        allocator = cache.token_to_kv_pool_allocator
++        capacity = allocator.size_full
++        available = cache._component_available_size(cache.tree_components[0])
++        evictable = cache.full_evictable_size()
++        if not 0 < capacity or not 0 <= available <= capacity or not 0 <= evictable <= capacity - available:
++            raise ValueError("invalid full-token pool accounting")
++        if waiting_requests < 0:
++            raise ValueError("negative waiting request count")
++        queue_now = self.queue_clock()
++        ages = [max(0.0, queue_now - entry) for entry in waiting_entry_times
++                if entry > 0]
++        ages.sort()
++        if len(ages) > waiting_requests:
++            raise ValueError("more queue ages than waiting requests")
++
++        elapsed = None if self.last_sample is None else now - self.last_sample
++        allocated = capacity - available
++        controller = cache.cache_controller
++        if controller is None:
++            queued_tokens = queued_bytes = submitted_tokens = submitted_bytes = 0
++            queued_ops = submitted_ops = 0
++        else:
++            queued = controller.load_queue
++            submitted = controller.ack_load_queue
++            queued_ops = len(queued)
++            submitted_ops = len(submitted)
++            queued_tokens = sum(len(op.device_indices) for op in queued)
++            queued_bytes = sum(controller._transfer_num_bytes(op) for op in queued)
++            submitted_tokens = sum(ack.num_tokens for ack in submitted)
++            submitted_bytes = sum(ack.num_bytes for ack in submitted)
++        sample = {
++            "monotonic_s": now,
++            "elapsed_since_sample_s": elapsed,
++            "capacity_tokens": capacity,
++            "available_tokens": available,
++            "evictable_tokens": evictable,
++            "allocated_tokens": allocated,
++            "non_evictable_tokens": allocated - evictable,
++            "allocation_usage": allocated / capacity,
++            "non_evictable_usage": (allocated - evictable) / capacity,
++            "waiting_requests": waiting_requests,
++            "waiting_age_observed_requests": len(ages),
++            "waiting_age_max_s": ages[-1] if ages else None,
++            "waiting_age_p95_s": (ages[max(0, (95 * len(ages) + 99) // 100 - 1)]
++                                  if ages else None),
++            # Attempt counts since the previous sample, not distinct requests
++            # or exact token shortfalls. A blocked request may retry many times.
++            "prefill_no_token_attempts": self.no_token_attempts,
++            "prefill_prefetch_pending_attempts": self.prefetch_pending_attempts,
++            # This is a node count, not the number of in-flight tokens.
++            "h2d_inflight_nodes": len(cache.ongoing_load_back),
++            "h2d_queued_ops": queued_ops,
++            "h2d_queued_tokens": queued_tokens,
++            "h2d_queued_bytes": queued_bytes,
++            "h2d_submitted_ops": submitted_ops,
++            "h2d_submitted_tokens": submitted_tokens,
++            "h2d_submitted_bytes": submitted_bytes,
++            # Both queue stages have allocated device indices. Their tokens
++            # are already included in allocated_tokens, not added to it.
++            "h2d_reserved_tokens": queued_tokens + submitted_tokens,
++        }
++        self.last_sample = now
++        self.next_due = now + self.interval_s
++        self.no_token_attempts = 0
++        self.prefetch_pending_attempts = 0
++        return sample
+diff --git a/python/sglang/srt/mem_cache/joint_policy/probability_residency.py b/python/sglang/srt/mem_cache/joint_policy/probability_residency.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5a0f95bff8d10934a8bd9ecd00757634d22e4900
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/joint_policy/probability_residency.py
+@@ -0,0 +1,119 @@
++"""Minimal probability-controlled HBM residency model.
++
++The model deliberately has one policy signal: the current cumulative
++probability that a waiting tool call has returned.  A session keeps the same
++fraction of its reusable KV on the device.  Increasing probability therefore
++produces a proactive Reload decision even before the next request arrives.
++"""
++
++from __future__ import annotations
++
++import math
++import time
++from dataclasses import dataclass
++from typing import Optional
++
++
++@dataclass(frozen=True)
++class ProbabilityResidencyDecision:
++    total_tokens: int
++    resident_tokens: int
++    target_tokens: int
++    evict_tokens: int
++    reload_tokens: int
++
++
++@dataclass
++class ReloadMicrobatchState:
++    """Collect independent session Reload decisions for one short window."""
++
++    window_s: float
++    first_enqueue_time: Optional[float] = None
++    operations: int = 0
++    planned_tokens: int = 0
++    urgent_requested: bool = False
++
++    def enqueue(
++        self,
++        planned_tokens: int,
++        *,
++        urgent: bool = False,
++        now: Optional[float] = None,
++    ) -> None:
++        if planned_tokens <= 0:
++            raise ValueError("planned_tokens must be positive")
++        if self.window_s < 0:
++            raise ValueError("window_s must be non-negative")
++        now = time.monotonic() if now is None else now
++        if self.first_enqueue_time is None:
++            self.first_enqueue_time = now
++        self.operations += 1
++        self.planned_tokens += planned_tokens
++        self.urgent_requested = self.urgent_requested or urgent
++
++    def should_flush(self, *, urgent: bool = False, now: Optional[float] = None) -> bool:
++        if self.operations == 0:
++            return False
++        if urgent or self.urgent_requested or self.window_s == 0:
++            return True
++        now = time.monotonic() if now is None else now
++        return now - self.first_enqueue_time >= self.window_s - 1e-9
++
++    def drain(self, now: Optional[float] = None) -> dict:
++        if self.operations == 0:
++            return {}
++        now = time.monotonic() if now is None else now
++        result = {
++            "operations": self.operations,
++            "planned_tokens": self.planned_tokens,
++            "urgent": self.urgent_requested,
++            "aggregation_wait_ms": round(
++                1000 * (now - self.first_enqueue_time), 3
++            ),
++        }
++        self.first_enqueue_time = None
++        self.operations = 0
++        self.planned_tokens = 0
++        self.urgent_requested = False
++        return result
++
++
++def decide_probability_residency(
++    *,
++    total_tokens: int,
++    resident_tokens: int,
++    return_probability: float,
++    page_size: int,
++) -> ProbabilityResidencyDecision:
++    """Map tool-return probability to a page-aligned HBM target.
++
++    ``target = probability * reusable KV`` is rounded up to a cache page so a
++    non-zero probability keeps at least one page and the radix structure is
++    never cut inside a page.  The returned delta has exactly one direction.
++    """
++    if total_tokens < 0 or resident_tokens < 0:
++        raise ValueError("token counts must be non-negative")
++    if resident_tokens > total_tokens:
++        raise ValueError("resident_tokens cannot exceed total_tokens")
++    if page_size <= 0:
++        raise ValueError("page_size must be positive")
++    if not 0.0 <= return_probability <= 1.0:
++        raise ValueError("return_probability must be in [0, 1]")
++
++    if total_tokens == 0 or return_probability == 0.0:
++        target = 0
++    elif return_probability == 1.0:
++        target = total_tokens
++    else:
++        target = min(
++            total_tokens,
++            math.ceil(return_probability * total_tokens / page_size) * page_size,
++        )
++
++    return ProbabilityResidencyDecision(
++        total_tokens=total_tokens,
++        resident_tokens=resident_tokens,
++        target_tokens=target,
++        evict_tokens=max(0, resident_tokens - target),
++        reload_tokens=max(0, target - resident_tokens),
++    )
+diff --git a/python/sglang/srt/mem_cache/joint_policy/residency_invariants.py b/python/sglang/srt/mem_cache/joint_policy/residency_invariants.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..79ab3cb226cf493d7a0f3cdd2ecfb55378cbbc5a
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/joint_policy/residency_invariants.py
+@@ -0,0 +1,85 @@
++"""Lock-independent FULL residency invariants.
++
++``UnifiedTreeCore.sanity_check`` already validates these structural rules, but
++it is unreachable during the probability-residency experiments: it is gated on
++``SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK`` (CI-only default), restricted to
++hybrid SWA/Mamba models, skipped whenever a streaming session holds KV, and
++only ever called from ``Scheduler.on_idle``.  A dense model driven by streaming
++sessions under load therefore never runs it, so a broken residency chain stays
++invisible until some later request walks the path and trips the assertion in
++``FullComponent.acquire_component_lock``.
++
++The rules below read only ``value``/``host_value`` presence, never lock_ref, so
++unlike the full sanity check they stay valid while streaming sessions hold
++their cross-turn locks -- which is what makes them usable as a per-mutation
++probe inside the pressure window.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Iterable, Optional
++
++
++@dataclass(frozen=True)
++class NodeResidency:
++    """Residency state of one non-root tree node.
++
++    ``parent_id`` is None when the parent is the tree root, which always holds
++    a device value and is therefore never a contiguity violation.
++    """
++
++    node_id: int
++    parent_id: Optional[int]
++    has_device: bool
++    has_host: bool
++
++
++def find_residency_contiguity_violations(
++    nodes: Iterable[NodeResidency],
++    *,
++    is_write_back: bool,
++) -> list[str]:
++    """Return one message per violated FULL residency rule (empty == healthy).
++
++    Three rules, mirroring ``sanity_check`` PART 2:
++
++    1. Device residency is contiguous from the root down.  A node holding a
++       device value under an evicted parent is the "hole" that later crashes
++       ``acquire_component_lock``; FULL device eviction is only legal from
++       leaves, and ``build_hicache_transfers`` relies on that to stop its
++       upward walk at the first resident ancestor.
++    2. Outside write-back mode, host backup is contiguous the same way.
++    3. Every node keeps FULL data on at least one layer; a node with neither
++       is unreachable and can never be loaded back.
++    """
++    by_id = {node.node_id: node for node in nodes}
++    violations: list[str] = []
++
++    for node in by_id.values():
++        if not node.has_device and not node.has_host:
++            violations.append(
++                f"node {node.node_id} dead: no FULL device and no FULL host"
++            )
++
++        if node.parent_id is None:
++            continue
++        parent = by_id.get(node.parent_id)
++        if parent is None:
++            violations.append(
++                f"node {node.node_id} parent {node.parent_id} missing from tree"
++            )
++            continue
++
++        if node.has_device and not parent.has_device:
++            violations.append(
++                f"node {node.node_id} device present but parent "
++                f"{node.parent_id} evicted"
++            )
++        if node.has_host and not parent.has_host and not is_write_back:
++            violations.append(
++                f"node {node.node_id} backed up but parent "
++                f"{node.parent_id} not backed up"
++            )
++
++    return violations
+diff --git a/python/sglang/srt/mem_cache/joint_policy/two_phase.py b/python/sglang/srt/mem_cache/joint_policy/two_phase.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7cf2571916b3653591aa5287cfa0bfd502d5c12a
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/joint_policy/two_phase.py
+@@ -0,0 +1,286 @@
++"""Experimental v6 controller. Units: allocator tokens; clock: scheduler monotonic.
++
++Feasibility uses a preemptible shared link, per-session rate caps and common
++release time. Host-ready suffixes only. No claim about unknown future requests.
++"""
++from dataclasses import dataclass
++import math
++import os
++import time
++import logging
++
++logger = logging.getLogger(__name__)
++
++@dataclass(frozen=True)
++class Job:
++    sid: str
++    deadline: float
++    total: int
++    resident: int
++    reclaimable: int
++    host_ready: bool = True
++
++    def __post_init__(self):
++        if not math.isfinite(self.deadline) or not 0 <= self.reclaimable <= self.resident <= self.total:
++            raise ValueError('invalid residency snapshot')
++
++
++def feasible(jobs, missing, now, shared_rate, session_rate):
++    """Exact time-expanded max flow for the stated fluid H2D model."""
++    if not all(math.isfinite(v) and v > 0 for v in (shared_rate, session_rate)):
++        raise ValueError("bandwidth must be positive")
++    if any(not j.host_ready and missing[j.sid] > 0 for j in jobs):
++        return False
++    deadlines = sorted({j.deadline for j in jobs if missing[j.sid] > 0})
++    if any(j.deadline <= now and missing[j.sid] > 0 for j in jobs):
++        return False
++    intervals = list(zip([now] + deadlines[:-1], deadlines))
++    n = 2 + len(jobs) + len(intervals)
++    sink = n - 1
++    graph = [dict() for _ in range(n)]
++    def edge(a, b, c):
++        graph[a][b] = c
++        graph[b][a] = 0.0
++    demand = 0
++    for i, j in enumerate(jobs, 1):
++        amount = missing[j.sid]
++        if amount < 0:
++            raise ValueError("negative missing tokens")
++        demand += amount
++        edge(0, i, amount)
++        for k, (a, b) in enumerate(intervals, 1 + len(jobs)):
++            if b <= j.deadline:
++                edge(i, k, session_rate * (b-a))
++    for k, (a, b) in enumerate(intervals, 1 + len(jobs)):
++        edge(k, sink, shared_rate * (b-a))
++    flow = 0.0
++    while flow + 1e-6 < demand:
++        parent = {0: None}
++        queue = [0]
++        for a in queue:
++            for b, capacity in graph[a].items():
++                if capacity > 1e-8 and b not in parent:
++                    parent[b] = a
++                    queue.append(b)
++            if sink in parent:
++                break
++        if sink not in parent:
++            return False
++        delta = float('inf')
++        b = sink
++        while b:
++            a = parent[b]
++            delta = min(delta, graph[a][b])
++            b = a
++        b = sink
++        while b:
++            a = parent[b]
++            graph[a][b] -= delta
++            graph[b][a] += delta
++            b = a
++        flow += delta
++    return True
++
++
++def plan_evict(jobs, now, shared_rate, session_rate, limit, page):
++    """Far deadline first; binary search each page-aligned safe increment.
++
++    Returns actual target reductions, boundary flag, and initial feasibility.
++    The constraints form a flow polymatroid; greedy computes a maximum total
++    extension. An operational limit truncates that extension to one quantum.
++    """
++    if page <= 0 or limit < 0:
++        raise ValueError("invalid page or limit")
++    missing = {j.sid: j.total-j.resident for j in jobs}
++    if not feasible(jobs, missing, now, shared_rate, session_rate):
++        return {}, False, False
++    reductions = {}
++    remaining = int(limit) // page
++    for j in sorted(jobs, key=lambda x: (x.deadline, x.sid), reverse=True):
++        lo, hi = 0, min(j.reclaimable // page, remaining)
++        original = missing[j.sid]
++        while lo < hi:
++            mid = (lo+hi+1)//2
++            missing[j.sid] = original + mid*page
++            if feasible(jobs, missing, now, shared_rate, session_rate):
++                lo = mid
++            else:
++                hi = mid-1
++        missing[j.sid] = original + lo*page
++        if lo:
++            reductions[j.sid] = lo*page
++            remaining -= lo
++    # Check whether even one more page can be reclaimed safely.
++    boundary = True
++    for j in jobs:
++        if j.reclaimable - reductions.get(j.sid, 0) >= page:
++            missing[j.sid] += page
++            possible = feasible(jobs, missing, now, shared_rate, session_rate)
++            missing[j.sid] -= page
++            if possible:
++                boundary = False
++                break
++    return reductions, boundary, True
++
++
++def reload_targets(jobs, now, shared_rate, session_rate, horizon, page):
++    """Minimum EDF repairs to remain feasible at the next control tick.
++
++    Returned amounts are targets to submit, NOT completed transfers.
++    """
++    missing = {j.sid: j.total-j.resident for j in jobs}
++    targets = {}
++    for j in sorted(jobs, key=lambda x: (x.deadline, x.sid)):
++        if feasible(jobs, missing, now+horizon, shared_rate, session_rate):
++            break
++        old = missing[j.sid]
++        if not old:
++            continue
++        missing[j.sid] = 0
++        if feasible(jobs, missing, now+horizon, shared_rate, session_rate):
++            lo, hi = 0, math.ceil(old/page)
++            while lo < hi:
++                mid = (lo+hi)//2
++                missing[j.sid] = max(0, old-mid*page)
++                if feasible(jobs, missing, now+horizon, shared_rate, session_rate):
++                    hi = mid
++                else:
++                    lo = mid+1
++            missing[j.sid] = max(0, old-lo*page)
++        targets[j.sid] = j.total-missing[j.sid]
++    return targets
++
++
++class TwoPhaseController:
++    def __init__(self, cache):
++        import torch
++        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
++            raise ValueError('two-phase v6 currently supports one GPU/rank only')
++        from sglang.srt.mem_cache.unified_cache.components import ComponentType
++        if list(cache.tree_components) != [ComponentType.FULL]:
++            raise ValueError('two-phase v6 supports Full KV only')
++        if not cache.enable_session_radix_cache or cache.cache_controller is None:
++            raise ValueError('two-phase v6 requires session radix cache and HiCache')
++        self.cache = cache
++        self.deadlines = {}
++        self.phase = 'ADJUST'
++        self.last_tick = 0.0
++        self.interval = float(os.getenv('SGLANG_TWO_PHASE_INTERVAL', '0.05'))
++        self.shared = float(os.getenv('SGLANG_TWO_PHASE_SHARED_TOKENS_S', '80000'))
++        self.per_session = float(os.getenv('SGLANG_TWO_PHASE_SESSION_TOKENS_S', '10000'))
++        self.quantum = int(os.getenv('SGLANG_TWO_PHASE_QUANTUM_TOKENS', '8192'))
++        self.high = float(os.getenv('SGLANG_TWO_PHASE_PRESSURE_HIGH', '0.85'))
++        self.low = float(os.getenv('SGLANG_TWO_PHASE_PRESSURE_LOW', '0.70'))
++        if not (0 <= self.low < self.high <= 1) or not all(math.isfinite(v) and v > 0 for v in (self.shared, self.per_session, self.interval, self.quantum)) or self.quantum < cache.page_size:
++            raise ValueError('invalid two-phase configuration')
++        self.pressure = False
++        self.demand_only = os.getenv('SGLANG_TWO_PHASE_DEMAND_ONLY', '0') == '1'
++        self.busy = False
++        self.last_decision = {}
++
++    def update(self, sid, action, seconds):
++        if action == 'begin':
++            if seconds is None or not math.isfinite(seconds) or not 0 < seconds <= 3600:
++                raise ValueError('deadline_seconds must be within (0, 3600]')
++            if sid not in self.deadlines:
++                self.deadlines[sid] = time.monotonic()+seconds
++            # No zero-residency update on tool entry.
++        elif action == 'end':
++            self.deadlines.pop(sid, None)
++            return self.cache.set_tool_return_probability(sid, 1.0)
++        elif action != 'poll':
++            raise ValueError('invalid two_phase_action')
++        self.tick()
++        return {'applied': True, 'action': 'two_phase', **self.last_decision}
++
++    def snapshot(self):
++        cache = self.cache
++        from sglang.srt.mem_cache.unified_cache.components import ComponentType
++        full = ComponentType.FULL
++        paths = {sid: cache._session_full_path(sid) for sid in self.deadlines}
++        counts = {}
++        for path in paths.values():
++            for node in path:
++                counts[node.id] = counts.get(node.id, 0)+1
++        jobs = []
++        for sid, path in paths.items():
++            if not path:
++                continue
++            total = sum(len(n.key) for n in path)
++            resident = sum(len(n.key) for n in path if n.component_data[full].value is not None)
++            safe = 0
++            for node in reversed(path):
++                cd = node.component_data[full]
++                if cd.value is None:
++                    continue
++                if counts[node.id] > 1 or cd.host_value is None or node.write_through_pending_id is not None or any(d.lock_ref > 0 for d in node.component_data):
++                    break
++                # Ancestor nodes become leaves after their suffix is demoted;
++                # disallow alternative resident branches.
++                if any(c not in path for c in node.children.values()):
++                    break
++                safe += len(node.key)
++            ready = all(n.component_data[full].host_value is not None and n.write_through_pending_id is None
++                        for n in path if n.component_data[full].value is None)
++            jobs.append(Job(sid, self.deadlines[sid], total, resident, safe, ready))
++        return jobs
++
++    def tick(self, shortfall=0):
++        if self.busy:
++            return 0
++        now = time.monotonic()
++        if not shortfall and now-self.last_tick < self.interval:
++            return 0
++        self.busy = True
++        try:
++            self.last_tick = now
++            cache = self.cache
++            # Conservatively freeze decisions while H2D is outstanding. Do not
++            # treat allocated/in-flight pages as completed resident data.
++            if cache.ongoing_load_back:
++                self.last_decision = {'phase': self.phase, 'deferred': 'h2d_inflight'}
++                return 0
++            jobs = self.snapshot()
++            usage = cache._device_token_usage()
++            if usage is not None:
++                if usage >= self.high:
++                    self.pressure = True
++                elif usage <= self.low:
++                    self.pressure = False
++            page = cache.page_size
++            # Leave one control interval for submission and scheduler overhead.
++            check_now = now+self.interval*2
++            missing = {j.sid: j.total-j.resident for j in jobs}
++            ok = feasible(jobs, missing, check_now, self.shared, self.per_session)
++            self.phase = 'ADJUST' if ok else 'INFEASIBLE'
++            freed = 0
++            reductions = {}
++            boundary = False
++            if ok and (shortfall or (self.pressure and not self.demand_only)):
++                limit = (math.ceil(shortfall/page)*page if shortfall and self.last_decision.get('boundary') else self.quantum)
++                reductions, boundary, ok = plan_evict(jobs, check_now, self.shared, self.per_session, limit, page)
++                self.phase = 'STEADY' if boundary else 'ADJUST'
++                before = cache._component_available_size(cache.tree_components[0])
++                for j in sorted(jobs, key=lambda x: x.deadline, reverse=True):
++                    amount = reductions.get(j.sid, 0)
++                    if amount:
++                        cache.set_tool_return_probability(j.sid, (j.resident-amount)/j.total)
++                after = cache._component_available_size(cache.tree_components[0])
++                freed = max(0, after-before)
++            jobs = self.snapshot()
++            _, boundary, ok = plan_evict(jobs, check_now, self.shared, self.per_session, 0, page)
++            self.phase = ('STEADY' if boundary else 'ADJUST') if ok else 'INFEASIBLE'
++            if not shortfall:
++                targets = reload_targets(jobs, now, self.shared, self.per_session, self.interval*2, page)
++                for j in sorted(jobs, key=lambda x: x.deadline):
++                    if j.sid in targets:
++                        cache.set_tool_return_probability(j.sid, targets[j.sid]/j.total)
++            self.last_decision = {'phase': self.phase, 'pressure': self.pressure,
++                'demand_only': self.demand_only,
++                'shortfall_tokens': shortfall, 'planned_evict_tokens': sum(reductions.values()),
++                'freed_tokens': freed, 'boundary': boundary, 'model_feasible': ok}
++            if shortfall or reductions or not ok:
++                logger.info('two-phase decision: %s', self.last_decision)
++            return freed
++        finally:
++            self.busy = False
+diff --git a/python/sglang/srt/mem_cache/unified_cache/components/base.py b/python/sglang/srt/mem_cache/unified_cache/components/base.py
+index e9c3996056f7068a1f2c18c39d63b8d2df62407c..efbf3905865e56c5c1cafcff0397c9c8cd9f8280 100644
+--- a/python/sglang/srt/mem_cache/unified_cache/components/base.py
++++ b/python/sglang/srt/mem_cache/unified_cache/components/base.py
+@@ -143,6 +143,12 @@ class TreeComponent(ABC):
+     def reset_session_state(self) -> None:
+         self._session_leaves = defaultdict(set)
+ 
++    def session_leaves(self, session_id: str) -> tuple[UnifiedTreeNode, ...]:
++        """Return a stable snapshot of the indexed frontiers for a session."""
++        return tuple(
++            sorted(self._session_leaves.get(session_id, ()), key=lambda n: n.id)
++        )
++
+     def session_ref(self, node: UnifiedTreeNode) -> int:
+         return node.component_data[self.component_type].session_ref
+ 
+diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
+index 421a2157228489da4c251c8ac26ef8135451b5b2..5fba3f4110cfb762d6c58ca260b8d5eb38aa2a4e 100644
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import atexit
+ import logging
++import os
+ import threading
+ import time
+ from dataclasses import replace
+@@ -45,6 +46,14 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+     PrefetchOperation,
+ )
+ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
++from sglang.srt.mem_cache.joint_policy.probability_residency import (
++    ReloadMicrobatchState,
++    decide_probability_residency,
++)
++from sglang.srt.mem_cache.joint_policy.residency_invariants import (
++    NodeResidency,
++    find_residency_contiguity_violations,
++)
+ from sglang.srt.mem_cache.radix_cache import RadixKey
+ from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+@@ -273,6 +282,100 @@ class UnifiedRadixCache(BasePrefixCache):
+         self.prefetch_timeout_base = 1.0
+         self.prefetch_timeout_per_page = 0.25
+         self.hicache_storage_pass_prefix_keys = False
++        reload_batch_window_ms = float(
++            os.environ.get("SGLANG_PROBABILITY_RELOAD_BATCH_WINDOW_MS", "100")
++        )
++        if reload_batch_window_ms < 0:
++            raise ValueError(
++                "SGLANG_PROBABILITY_RELOAD_BATCH_WINDOW_MS must be non-negative"
++            )
++        self.probability_reload_batch = ReloadMicrobatchState(
++            window_s=reload_batch_window_ms / 1000
++        )
++        # Per-mutation residency probe. UnifiedTreeCore.sanity_check cannot
++        # cover these experiments (CI-only env default, hybrid-model-only,
++        # skipped while a streaming session holds KV, and called only from
++        # on_idle), so a broken chain would otherwise stay silent until a
++        # later request trips acquire_component_lock. Off by default: it
++        # walks the whole tree, which is too costly for every update.
++        self.probability_residency_check = (
++            os.environ.get("SGLANG_PROBABILITY_RESIDENCY_CHECK", "0") == "1"
++        )
++        self.probability_residency_violations = 0
++        # Cap proactive Reload at currently-free device space. Without it,
++        # load_back(req=None) carries no mem_quota, so _load_back_transfers
++        # calls evict_for_alloc and a speculative Reload evicts committed KV
++        # belonging to other sessions -- unlike every request-driven path,
++        # which is admitted against a prefill budget first. Off by default so
++        # the frozen 3.0 numbers stay reproducible.
++        self.probability_reload_budget = (
++            os.environ.get("SGLANG_PROBABILITY_RELOAD_BUDGET", "0") == "1"
++        )
++        # Back up unbacked ancestors before a policy demote. The policy calls
++        # backup_node_for_write_back, whose action is built with
++        # write_back=True and therefore skips the ancestor chain -- but this
++        # server runs write_through, where a backed-up node requires a
++        # backed-up parent. Off by default so the frozen behaviour is
++        # reproducible and the fix can be ablated on its own.
++        self.probability_backup_chain = (
++            os.environ.get("SGLANG_PROBABILITY_BACKUP_CHAIN", "0") == "1"
++        )
++        # H2D producer slots the proactive flush leaves for the request path.
++        # LayerDoneCounter has 3 slots and the prefill path takes one
++        # unguarded, so a background producer that checks only the next slot
++        # can take the one requests are about to need -- which asserts in
++        # update_producer under the prefill traceback, not here. 0 reproduces
++        # the frozen behaviour.
++        self.probability_producer_reserve = int(
++            os.environ.get("SGLANG_PROBABILITY_PRODUCER_RESERVE", "0")
++        )
++        if not 0 <= self.probability_producer_reserve <= 2:
++            raise ValueError(
++                "SGLANG_PROBABILITY_PRODUCER_RESERVE must be 0, 1, or 2"
++            )
++        # Device usage below which a proactive demote is skipped.
++        #
++        # Under write_through a demote is free (the host copy already exists;
++        # `demote` only releases device pages), which means native on-demand
++        # eviction is equally free and can reclaim the same KV at the moment
++        # it is actually needed. Pre-evicting therefore buys no capacity that
++        # waiting would not also buy, while committing to the reload that
++        # follows -- measured at ~1.36M evicted + ~1.39M reloaded tokens per
++        # 5 runs, at a median device usage of 0.14.
++        #
++        # 0.0 = always evict (frozen behaviour). >1.0 = never pre-evict, which
++        # leaves capacity entirely to native eviction and keeps only the
++        # deadline-driven reload.
++        self.probability_evict_pressure = float(
++            os.environ.get("SGLANG_PROBABILITY_EVICT_PRESSURE", "0")
++        )
++        if not 0.0 <= self.probability_evict_pressure <= 2.0:
++            raise ValueError(
++                "SGLANG_PROBABILITY_EVICT_PRESSURE must be within [0, 2]"
++            )
++        self.two_phase_enabled = os.getenv("SGLANG_TWO_PHASE_PRESSURE", "0") == "1"
++        self.deadline_floor_enabled = (
++            os.getenv("SGLANG_DEADLINE_FLOOR", "0") == "1"
++        )
++        if self.two_phase_enabled and self.deadline_floor_enabled:
++            raise ValueError(
++                "SGLANG_TWO_PHASE_PRESSURE and SGLANG_DEADLINE_FLOOR are mutually exclusive"
++            )
++        self.probability_reload_foreground_first = (
++            os.getenv("SGLANG_PROBABILITY_RELOAD_FOREGROUND_FIRST", "0") == "1"
++        )
++        self.probability_foreground_pending = False
++        self.deadline_floor_scheduler_idle = False
++        self.two_phase_controller = None
++        self.deadline_floor_controller = None
++        if self.two_phase_enabled or self.deadline_floor_enabled:
++            # Prevent speculative Reload from causing native eviction. The
++            # selected deadline controller owns policy demotion; retain the
++            # backup-chain and producer-reserve fixes.
++            self.probability_reload_budget = True
++            self.probability_backup_chain = True
++            self.probability_producer_reserve = max(1, self.probability_producer_reserve)
++            self.probability_evict_pressure = 0.0
+         # Buffer-only host memory mode (host RAM as transient GPU↔storage
+         # staging, not an L2 tier); resolved in init_hicache, which also
+         # constructs the pipeline collaborator (None = cache mode).
+@@ -390,6 +493,17 @@ class UnifiedRadixCache(BasePrefixCache):
+             CacheRequestHandle, int
+         ] = {}
+         self.storage_prefetch_retries = StoragePrefetchRetries()
++        if self.two_phase_controller is not None:
++            self.two_phase_controller.deadlines.clear()
++            self.two_phase_controller.last_decision = {}
++        if self.deadline_floor_controller is not None:
++            self.deadline_floor_controller.deadlines.clear()
++            self.deadline_floor_controller.last_decision = {}
++        self.probability_reload_batch.first_enqueue_time = None
++        self.probability_reload_batch.operations = 0
++        self.probability_reload_batch.planned_tokens = 0
++        self.probability_reload_batch.urgent_requested = False
++        self.probability_residency_violations = 0
+         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
+         if self.buffer_pipeline is not None:
+             self.buffer_pipeline.reset()
+@@ -540,8 +654,19 @@ class UnifiedRadixCache(BasePrefixCache):
+         self.sidecar_pool_specs.append(spec)
+ 
+     def release_host_resources(self) -> None:
++        """Quiesce background users before destroying pinned host buffers.
++
++        The storage backup thread reads ``mem_pool_host.kv_buffer`` while
++        persisting queued pages.  Destroying ``host_pool_group`` first sets
++        that buffer to ``None`` and races the thread during graceful SIGTERM.
++        ``detach_storage_backend`` sets the stop event, wakes and joins all
++        storage threads, and closes the backend.  Only after it returns is it
++        safe to unregister and clear the host buffers.
++        """
+         if self.linker is not None:
+             self.linker.close()
++        if self.cache_controller is not None:
++            self.cache_controller.detach_storage_backend()
+         if self.host_pool_group is not None:
+             self.host_pool_group.destroy()
+ 
+@@ -612,6 +737,33 @@ class UnifiedRadixCache(BasePrefixCache):
+         if self.disable:
+             return EvictResult()
+ 
++        deadline_floor_enabled = getattr(self, "deadline_floor_enabled", False)
++        if (self.two_phase_enabled or deadline_floor_enabled) and params.num_tokens > 0:
++            controller = (
++                self._get_deadline_floor_controller()
++                if deadline_floor_enabled
++                else self._get_two_phase_controller()
++            )
++            before = self._component_available_size(ComponentType.FULL)
++            target = before + params.num_tokens
++            # Fixed-size adjustments until the feasible boundary; thereafter
++            # exact shortfall. Measure allocator feedback after every action.
++            while self._component_available_size(ComponentType.FULL) < target:
++                deficit = target - self._component_available_size(ComponentType.FULL)
++                if not controller.tick(shortfall=deficit):
++                    break
++            freed = max(0, self._component_available_size(ComponentType.FULL)-before)
++            remaining = max(0, params.num_tokens-freed)
++            if remaining:
++                policy = "deadline-floor" if deadline_floor_enabled else "two-phase"
++                logger.warning("%s emergency native eviction: shortfall=%s decision=%s; p10 is not guaranteed", policy, remaining, controller.last_decision)
++            params = replace(params, num_tokens=remaining)
++            result = self._evict_for_alloc_native(params)
++            result.num_tokens_evicted += freed
++            return result
++        return self._evict_for_alloc_native(params)
++
++    def _evict_for_alloc_native(self, params: EvictParams) -> EvictResult:
+         request_by_type = self._evict_request_by_type(params)
+         available_size_targets = {
+             ct: (ct, self._component_available_size(ct) + request_cnt)
+@@ -696,6 +848,27 @@ class UnifiedRadixCache(BasePrefixCache):
+             return self.req_to_token_pool.mamba_allocator.schedulable_available_size()
+         raise ValueError(f"Unsupported cache component: {component_type}")
+ 
++    def _device_token_usage(self) -> Optional[float]:
++        """Fraction of the Full device pool in use, or None if unavailable.
++
++        Same quantity the scheduler logs as "token usage" and the client
++        scrapes from `sglang:token_usage`, so a policy threshold here is
++        comparable to the pressure watermarks used on the driver side.
++        """
++        allocator = self.token_to_kv_pool_allocator
++        # size_full is a property on BaseTokenToKVPoolAllocator and is
++        # overridden by the SWA / hisparse / mamba allocators, so read it as
++        # an attribute and only fall back to `size` when it is absent.
++        total = getattr(allocator, "size_full", None)
++        if callable(total):
++            total = total()
++        if not total:
++            total = getattr(allocator, "size", None)
++        if not total:
++            return None
++        avail = self._component_available_size(ComponentType.FULL)
++        return max(0.0, min(1.0, 1.0 - avail / total))
++
+     def _evict(
+         self,
+         params: EvictParams,
+@@ -1577,6 +1750,45 @@ class UnifiedRadixCache(BasePrefixCache):
+ 
+     # ---- HiCache: Backup / LoadBack ----
+ 
++    def _backup_with_ancestors(self, node: UnifiedTreeNode) -> bool:
++        """Back up a node and its unbacked ancestors, ancestors first.
++
++        ``backup_node_for_write_back`` builds its action with
++        ``write_back=True``, so ``_build_backup_kv_action`` backs up the single
++        node and skips the ancestor chain -- correct under write_back, where
++        host contiguity is not required. Under write_through it is not: the
++        tree requires a backed-up node's parent to be backed up too (the same
++        rule ``sanity_check`` asserts with ``and not self.is_write_back``).
++        Backing up only the node leaves "node X backed up but parent Y not
++        backed up" and the eviction loop then breaks on the next node.
++
++        Backing up an ancestor is additive -- it creates a host copy and
++        evicts nothing -- so this is safe even when the ancestor is shared
++        with another session. Returns False if any backup in the chain fails,
++        leaving the caller to stop rather than demote into a hole.
++        """
++        if self.tree_core.is_write_back or not self.probability_backup_chain:
++            return self.backup_node_for_write_back(node.id)
++
++        chain = [node]
++        ancestor = node.parent
++        while (
++            ancestor is not None
++            and ancestor is not self.tree_core.root_node
++            and not ancestor.backuped
++        ):
++            chain.append(ancestor)
++            ancestor = ancestor.parent
++        # Ancestors first, to preserve the host-backup invariant.
++        chain.reverse()
++
++        for target in chain:
++            if target.backuped:
++                continue
++            if not self.backup_node_for_write_back(target.id):
++                return False
++        return True
++
+     def backup_node_for_write_back(self, node_id: NodeId) -> bool:
+         """Synchronously back up one node (Full KV plus any unbacked component
+         state) and drain the ack -- the deferred-demote shape the eviction
+@@ -2959,6 +3171,15 @@ class UnifiedRadixCache(BasePrefixCache):
+             self.ongoing_prefetch[request] = info._replace(host_indices=host_indices)
+             if buffer_mode:
+                 cc.prefetch_tokens_occupied += alloc_len
++            reload_trace = getattr(cc, "reload_trace", None)
++            if reload_trace is not None:
++                reload_trace.emit(
++                    "enqueue",
++                    "l3_to_l2",
++                    str(operation.id),
++                    instance_id=operation.request_id,
++                    bytes=alloc_len * cc.mem_pool_host.size_per_token,
++                )
+             cc.prefetch_buffer.put(operation)
+             return True
+ 
+@@ -3369,6 +3590,10 @@ class UnifiedRadixCache(BasePrefixCache):
+         while finish_count > 0:
+             ack = cc.ack_load_queue.pop(0)
+             ack.finish_event.synchronize()
++            reload_trace = getattr(cc, "reload_trace", None)
++            if reload_trace is not None:
++                for trace_id in ack.reload_trace_ids or []:
++                    reload_trace.emit("finish", "l2_to_hbm", trace_id)
+             for ack_id in ack.node_ids:
+                 if (
+                     self.buffer_pipeline is not None
+@@ -3381,6 +3606,8 @@ class UnifiedRadixCache(BasePrefixCache):
+                 # Unpin the loaded nodes; host copies stay as reclaimable duplicates.
+                 self.tree_core.finish_load_back(node)
+ 
++            if cc.transfer_journal is not None:
++                cc.transfer_journal.complete(ack.reload_trace_ids or [])
+             if self.metrics_collector is not None:
+                 for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
+                     if num_tokens > 0:
+@@ -3599,8 +3826,286 @@ class UnifiedRadixCache(BasePrefixCache):
+         return self.session_refs.ensure_session_generation(session_id)
+ 
+     def release_radix_session(self, session_id: str) -> int:
++        if self.two_phase_controller is not None:
++            self.two_phase_controller.deadlines.pop(session_id, None)
++        if self.deadline_floor_controller is not None:
++            self.deadline_floor_controller.deadlines.pop(session_id, None)
+         return self.session_refs.release_radix_session(session_id)
+ 
++    def _session_full_path(self, session_id: str) -> list[UnifiedTreeNode]:
++        """Return the single reusable Full-KV path used by the first model.
++
++        Branching sessions are deliberately rejected: assigning one scalar
++        probability across several alternative continuations would introduce a
++        second policy decision that this minimal experiment does not model.
++        """
++        full = self.components[BASE_COMPONENT_TYPE]
++        leaves = full.session_leaves(session_id)
++        if len(leaves) != 1:
++            return []
++        path = []
++        node = leaves[0]
++        while node is not self.tree_core.root_node:
++            path.append(node)
++            node = node.parent
++        path.reverse()
++        return path
++
++    def _split_full_path_at(
++        self, path: list[UnifiedTreeNode], target_tokens: int
++    ) -> Optional[UnifiedTreeNode]:
++        """Return the node ending at target_tokens, splitting on a page boundary."""
++        if target_tokens == 0:
++            return None
++        covered = 0
++        for node in path:
++            end = covered + len(node.key)
++            if target_tokens == end:
++                return node
++            if covered < target_tokens < end:
++                prefix, action = self.tree_core._split_node(
++                    node.key, node, target_tokens - covered
++                )
++                if action is not None:
++                    self._apply_cache_actions([action])
++                return prefix
++            covered = end
++        return path[-1] if path else None
++
++    @rank_consensus(same_params=True, same_results=True)
++    def set_tool_return_probability(
++        self, session_id: str, return_probability: float
++    ) -> dict:
++        """Move a session toward ``probability * reusable KV`` device residency.
++
++        A rising probability queues H2D before the next generation request.
++        Independent sessions are merged during one short global microbatch
++        window.  A falling probability demotes the suffix to its existing host
++        copy.  The first experiment supports one radix path, Full KV, and
++        HBM<->DRAM only.
++        """
++        if not self.enable_session_radix_cache:
++            return {"applied": False, "reason": "session_radix_cache_disabled"}
++        if self.cache_controller is None:
++            return {"applied": False, "reason": "hicache_disabled"}
++
++        path = self._session_full_path(session_id)
++        if not path:
++            return {"applied": False, "reason": "session_missing_or_branched"}
++
++        # Probe BEFORE mutating. load_back takes its ancestor lock before
++        # building any transfer, so a hole that predates this call crashes
++        # inside acquire_component_lock and never reaches the post-mutation
++        # probe below. Only a pre-probe can attribute such a hole to whatever
++        # ran earlier (request-driven eviction) rather than to this policy.
++        pre_violations: list[str] = []
++        if self.probability_residency_check:
++            pre_violations = self.check_probability_residency_contiguity(
++                f"PRE session={session_id} p={return_probability}"
++            )
++
++        full = BASE_COMPONENT_TYPE
++        total_tokens = sum(len(node.key) for node in path)
++        resident_tokens = sum(
++            len(node.key)
++            for node in path
++            if node.component_data[full].value is not None
++        )
++        decision = decide_probability_residency(
++            total_tokens=total_tokens,
++            resident_tokens=resident_tokens,
++            return_probability=return_probability,
++            page_size=self.page_size,
++        )
++
++        result = {
++            "applied": True,
++            "session_id": session_id,
++            "return_probability": return_probability,
++            "total_tokens": decision.total_tokens,
++            "resident_tokens_before": decision.resident_tokens,
++            "target_tokens": decision.target_tokens,
++            "planned_evict_tokens": decision.evict_tokens,
++            "planned_reload_tokens": decision.reload_tokens,
++            "evicted_tokens": 0,
++            "action": "none",
++        }
++        if (decision.reload_tokens and self.probability_reload_foreground_first
++                and self.probability_foreground_pending):
++            # Allocator free space may already be needed by queued prefill.
++            # Decline speculation before splitting or allocating; the arriving
++            # request still uses the ordinary demand-loading path.
++            result.update(action="reload_deferred", reload_defer_reason="foreground_queue")
++            if pre_violations:
++                result["residency_violations_pre"] = len(pre_violations)
++                result["residency_first_violation_pre"] = pre_violations[0]
++            return result
++        device_usage: Optional[float] = None
++        if decision.evict_tokens and self.probability_evict_pressure > 0.0:
++            device_usage = self._device_token_usage()
++        below_pressure = (
++            bool(decision.evict_tokens)
++            and device_usage is not None
++            and device_usage < self.probability_evict_pressure
++        )
++        if below_pressure or not (decision.evict_tokens or decision.reload_tokens):
++            # A declined/no-op target must not fragment an already resident
++            # path. Keep the pre-probe, but no mutation needs a post-probe.
++            if below_pressure:
++                result.update(action="evict", evict_stop_reason="below_pressure",
++                              device_usage=round(device_usage, 4))
++            if pre_violations:
++                result["residency_violations_pre"] = len(pre_violations)
++                result["residency_first_violation_pre"] = pre_violations[0]
++            return result
++
++        boundary = self._split_full_path_at(path, decision.target_tokens)
++        # A split changes the path but preserves the indexed session frontier.
++        path = self._session_full_path(session_id)
++        tracker = {ct: 0 for ct in self.tree_components}
++        action = "none"
++        applied_quota: Optional[int] = None
++        stop_reason: Optional[str] = None
++
++        if decision.evict_tokens:
++            action = "evict"
++            # Which exit ended the walk. "evicted_tokens: 0" has five possible
++            # causes and the result dict could not tell them apart, so an
++            # abort could not be attributed without guessing.
++            stop_reason = "completed"
++            for node in reversed(path):  # leaf -> root
++                cd = node.component_data[full]
++                if cd.value is None:
++                    continue
++                if boundary is not None and node is boundary:
++                    stop_reason = "boundary"
++                    break
++                if any(data.lock_ref > 0 for data in node.component_data):
++                    stop_reason = "locked"
++                    break
++                # Never punch a hole above another device-resident branch.
++                if node not in self.tree_core.evictable_device_leaves:
++                    stop_reason = "not_evictable_leaf"
++                    break
++                if cd.host_value is None and not self._backup_with_ancestors(
++                    node
++                ):
++                    stop_reason = "backup_failed"
++                    break
++                self._demote(node.id, tracker)
++
++        elif decision.reload_tokens and boundary is not None:
++            action = "reload_queued"
++            if boundary.component_data[full].value is None:
++                # A speculative Reload spends only free space; a quota makes
++                # _load_back_transfers decline before it reaches
++                # evict_for_alloc, instead of taking another session's KV.
++                reload_quota = (
++                    self._component_available_size(ComponentType.FULL)
++                    if self.probability_reload_budget
++                    else None
++                )
++                applied_quota = reload_quota
++                submitted = self.load_back(
++                    boundary.id, mem_quota=reload_quota, req=None
++                )
++                if submitted:
++                    self.probability_reload_batch.enqueue(
++                        decision.reload_tokens,
++                        urgent=return_probability == 1.0,
++                    )
++                    if return_probability == 1.0:
++                        action = "reload_urgent_queued"
++                else:
++                    action = "reload_deferred"
++
++        result.update(evicted_tokens=tracker[full], action=action)
++        if stop_reason is not None:
++            result["evict_stop_reason"] = stop_reason
++        if device_usage is not None:
++            result["device_usage"] = round(device_usage, 4)
++        if applied_quota is not None:
++            # How tight the budget was when the Reload was planned; lets the
++            # analysis separate "declined for lack of free space" from the
++            # other reasons load_back can return False.
++            result["reload_free_tokens"] = applied_quota
++        if self.probability_residency_check:
++            if pre_violations:
++                result["residency_violations_pre"] = len(pre_violations)
++                result["residency_first_violation_pre"] = pre_violations[0]
++            if action != "none":
++                post = self.check_probability_residency_contiguity(
++                    f"POST session={session_id} action={action} "
++                    f"p={return_probability}"
++                )
++                if post:
++                    result["residency_violations"] = len(post)
++                    result["residency_first_violation"] = post[0]
++                # Attribution: what this mutation added, versus what it
++                # inherited from whatever ran before it.
++                before = set(pre_violations)
++                introduced = [v for v in post if v not in before]
++                if introduced:
++                    result["residency_violations_introduced"] = len(introduced)
++                    result["residency_first_introduced"] = introduced[0]
++                    logger.error(
++                        "probability residency INTRODUCED by session=%s "
++                        "action=%s p=%s (%d new):\n%s",
++                        session_id,
++                        action,
++                        return_probability,
++                        len(introduced),
++                        "\n".join(f"  {v}" for v in introduced[:10]),
++                    )
++        return result
++
++    def _get_two_phase_controller(self):
++        if not self.two_phase_enabled:
++            raise ValueError("two-phase runtime is disabled")
++        if self.two_phase_controller is None:
++            from sglang.srt.mem_cache.joint_policy.two_phase import TwoPhaseController
++            self.two_phase_controller = TwoPhaseController(self)
++        return self.two_phase_controller
++
++    def update_two_phase(self, session_id, action, deadline_seconds=None):
++        if self.deadline_floor_enabled:
++            return self._get_deadline_floor_controller().update(
++                session_id, action, deadline_seconds
++            )
++        return self._get_two_phase_controller().update(session_id, action, deadline_seconds)
++
++    def _get_deadline_floor_controller(self):
++        if not self.deadline_floor_enabled:
++            raise ValueError("deadline-floor runtime is disabled")
++        if self.deadline_floor_controller is None:
++            from sglang.srt.mem_cache.joint_policy.deadline_floor import (
++                DeadlineFloorController,
++            )
++
++            self.deadline_floor_controller = DeadlineFloorController(self)
++        return self.deadline_floor_controller
++
++    def flush_probability_reload_batch(self, *, urgent: bool = False) -> Optional[dict]:
++        """Submit queued session Reloads once their aggregation window expires."""
++        if self.two_phase_enabled:
++            self._get_two_phase_controller().tick()
++        elif self.deadline_floor_enabled:
++            self._get_deadline_floor_controller().tick()
++        now = time.monotonic()
++        if not self.probability_reload_batch.should_flush(urgent=urgent, now=now):
++            return None
++        # Do not wrap LayerDoneCounter and reuse an in-flight CUDA event. Under
++        # congestion, keeping operations in load_queue naturally coalesces them
++        # until one producer slot becomes available.
++        if not self.cache_controller.can_start_loading(
++            reserve=self.probability_producer_reserve
++        ):
++            return None
++        summary = self.probability_reload_batch.drain(now=now)
++        producer_id = self.ready_to_load_host_cache()
++        summary["producer_id"] = producer_id
++        return summary
++
+     # ---- Streaming session API (delegates to composed StreamingSession) ----
+ 
+     def supports_streaming_session(self) -> bool:
+@@ -3689,6 +4194,47 @@ class UnifiedRadixCache(BasePrefixCache):
+             )
+         return "\n".join(lines) + "\n"
+ 
++    def check_probability_residency_contiguity(self, context: str) -> list[str]:
++        """Probe FULL residency contiguity; returns violation messages.
++
++        Streaming-session safe (reads only value/host_value, never lock_ref),
++        so unlike ``sanity_check`` this runs inside the pressure window. It
++        logs and counts rather than raising: the point is to attribute the
++        damage to the mutation that caused it, while leaving the existing
++        ``acquire_component_lock`` assertion as the hard stop.
++        """
++        full = BASE_COMPONENT_TYPE
++        root = self.tree_core.root_node
++        nodes = []
++        for node in self.tree_core._collect_all_nodes():
++            if node is root:
++                continue
++            cd = node.component_data[full]
++            parent = node.parent
++            nodes.append(
++                NodeResidency(
++                    node_id=node.id,
++                    parent_id=(
++                        None if parent is None or parent is root else parent.id
++                    ),
++                    has_device=cd.value is not None,
++                    has_host=cd.host_value is not None,
++                )
++            )
++
++        violations = find_residency_contiguity_violations(
++            nodes, is_write_back=self.tree_core.is_write_back
++        )
++        if violations:
++            self.probability_residency_violations += len(violations)
++            logger.error(
++                "probability residency broken after %s (%d violations):\n%s",
++                context,
++                len(violations),
++                "\n".join(f"  {v}" for v in violations[:10]),
++            )
++        return violations
++
+     def sanity_check(self):
+         """Verify tree invariants.
+ 
+diff --git a/python/sglang/srt/observability/reload_trace.py b/python/sglang/srt/observability/reload_trace.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3d9e796abfde8572bae0dd1cc55ba8539d741200
+--- /dev/null
++++ b/python/sglang/srt/observability/reload_trace.py
+@@ -0,0 +1,47 @@
++"""Opt-in JSONL tracing for hierarchical-cache Reload transfers.
++
++This module intentionally contains only the runtime event writer. Analysis and
++plotting belong to the external SWE experiment layer, so SGLang does not depend
++on SWE-bench in order to start.
++"""
++
++from __future__ import annotations
++
++import json
++import threading
++import time
++from pathlib import Path
++
++TIERS = ("l3_to_l2", "l2_to_hbm")
++EVENTS = ("enqueue", "start", "finish")
++
++
++class ReloadTrace:
++    """Thread-safe event writer enabled by ``SGLANG_RELOAD_TRACE_PATH``."""
++
++    def __init__(self, path: str | Path):
++        self.path = Path(path)
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        self._lock = threading.Lock()
++
++    def emit(
++        self,
++        event: str,
++        tier: str,
++        transfer_id: str,
++        *,
++        instance_id: str = "",
++        bytes: int = 0,
++    ) -> None:
++        if event not in EVENTS or tier not in TIERS:
++            raise ValueError("invalid reload event or tier")
++        row = {
++            "event": event,
++            "tier": tier,
++            "transfer_id": transfer_id,
++            "instance_id": instance_id,
++            "bytes": bytes,
++            "time_ns": time.monotonic_ns(),
++        }
++        with self._lock, self.path.open("a", encoding="utf-8") as output:
++            output.write(json.dumps(row, ensure_ascii=False) + "\n")
+diff --git a/python/sglang/srt/observability/transfer_journal.py b/python/sglang/srt/observability/transfer_journal.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b14f7d3b99ed8c7d53d57365be02c864400eaf7
+--- /dev/null
++++ b/python/sglang/srt/observability/transfer_journal.py
+@@ -0,0 +1,64 @@
++"""Optional operation lifecycle audit; never authorizes allocation or transfer.
++
++IDs refer to immutable CacheOperations, not mutable radix node ranges. Active
++device tokens are already allocated; they must not be added to pool usage.
++"""
++
++import time
++
++
++class TransferJournal:
++    def __init__(self, emit, clock=time.monotonic):
++        self.emit = emit
++        self.clock = clock
++        self.active = {}
++        self.completed_ops = self.completed_tokens = self.completed_bytes = 0
++
++    def enqueue(self, operation_id, tokens, num_bytes):
++        if (operation_id in self.active or type(tokens) is not int or tokens < 0
++                or type(num_bytes) is not int or num_bytes < 0):
++            raise ValueError("invalid or duplicate transfer operation")
++        self.active[operation_id] = ("queued", tokens, num_bytes)
++        self._emit("queued", [operation_id])
++
++    def _batch(self, operation_ids, expected):
++        ids = list(operation_ids)
++        if (not ids or len(set(ids)) != len(ids)
++                or any(key not in self.active or self.active[key][0] != expected
++                       for key in ids)):
++            raise ValueError("invalid transfer lifecycle transition")
++        return ids
++
++    def submit(self, operation_ids):
++        ids = self._batch(operation_ids, "queued")
++        for key in ids:
++            _, tokens, size = self.active[key]
++            self.active[key] = ("submitted", tokens, size)
++        self._emit("submitted", ids)
++
++    def complete(self, operation_ids):
++        ids = self._batch(operation_ids, "submitted")
++        for key in ids:
++            _, tokens, size = self.active.pop(key)
++            self.completed_ops += 1
++            self.completed_tokens += tokens
++            self.completed_bytes += size
++        self._emit("acknowledged", ids)
++
++    def reset(self):
++        # Reset abandons observation, not proof of DMA cancellation/completion.
++        ids = list(self.active)
++        self._emit("reset_unresolved", ids)
++        self.active.clear()
++
++    def _emit(self, stage, ids):
++        event = dict(stage=stage, operation_ids=ids, monotonic_s=self.clock(),
++                     completed_ops=self.completed_ops,
++                     completed_tokens=self.completed_tokens,
++                     completed_bytes=self.completed_bytes)
++        for state in ("queued", "submitted"):
++            entries = [e for e in self.active.values() if e[0] == state]
++            event[state + "_ops"] = len(entries)
++            event[state + "_tokens"] = sum(e[1] for e in entries)
++            event[state + "_bytes"] = sum(e[2] for e in entries)
++        self.emit(event)
+diff --git a/test/registered/unit/mem_cache/test_deadline_floor.py b/test/registered/unit/mem_cache/test_deadline_floor.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ad5055f64cd01a751baacd5a1cc77c2296d6ecc2
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_deadline_floor.py
+@@ -0,0 +1,292 @@
++import ast
++import importlib.util
++import sys
++from dataclasses import dataclass, replace
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++ROOT = Path(__file__).resolve().parents[4]
++TWO_PHASE_SOURCE = ROOT / "python/sglang/srt/mem_cache/joint_policy/two_phase.py"
++FLOOR_SOURCE = ROOT / "python/sglang/srt/mem_cache/joint_policy/deadline_floor.py"
++
++two_phase_spec = importlib.util.spec_from_file_location(
++    "sglang.srt.mem_cache.joint_policy.two_phase", TWO_PHASE_SOURCE
++)
++two_phase = importlib.util.module_from_spec(two_phase_spec)
++sys.modules[two_phase_spec.name] = two_phase
++two_phase_spec.loader.exec_module(two_phase)
++
++floor_spec = importlib.util.spec_from_file_location("deadline_floor_test", FLOOR_SOURCE)
++floor = importlib.util.module_from_spec(floor_spec)
++sys.modules[floor_spec.name] = floor
++floor_spec.loader.exec_module(floor)
++
++DeadlineFloorController = floor.DeadlineFloorController
++Job = two_phase.Job
++feasible = two_phase.feasible
++
++
++def make_controller(
++    specs, *, shared=4, per_session=4, safety=1.0, capacity=100, free=0
++):
++    controller = object.__new__(DeadlineFloorController)
++    controller.deadlines = {sid: deadline for sid, deadline, _, _ in specs}
++    controller.last_tick = 0.0
++    controller.interval = 0.1
++    controller.shared = shared
++    controller.per_session = per_session
++    controller.safety = safety
++    controller.reserve_low = 0.10
++    controller.reserve_high = 0.15
++    controller.reserve_step = 0.02
++    controller.reserve_cooldown = 0.5
++    controller.idle_grace = 0.1
++    controller.reserve_active = False
++    controller.idle_since = None
++    controller.last_reserve = float("-inf")
++    controller.busy = False
++    controller.last_decision = {}
++    state = {
++        "resident": {sid: resident for sid, _, _, resident in specs},
++        "total": {sid: total for sid, _, total, _ in specs},
++        "free": free,
++        "calls": [],
++    }
++
++    def set_probability(sid, probability):
++        old = state["resident"][sid]
++        new = round(probability * state["total"][sid])
++        state["resident"][sid] = new
++        state["free"] += old - new
++        state["calls"].append((sid, new))
++        return {"applied": True}
++
++    controller.cache = SimpleNamespace(
++        page_size=1,
++        tree_components=(0,),
++        ongoing_load_back={},
++        deadline_floor_scheduler_idle=False,
++        token_to_kv_pool_allocator=SimpleNamespace(size_full=capacity),
++        _component_available_size=lambda _: state["free"],
++        set_tool_return_probability=set_probability,
++    )
++
++    def snapshot():
++        return [
++            Job(
++                sid,
++                deadline,
++                state["total"][sid],
++                state["resident"][sid],
++                state["resident"][sid],
++            )
++            for sid, deadline, _, _ in specs
++        ]
++
++    controller.snapshot = snapshot
++    return controller, state
++
++
++@patch.object(floor.time, "monotonic", return_value=10)
++def test_resident_at_or_above_floor_does_not_reload_or_evict(_):
++    controller, state = make_controller([("a", 20, 16, 16)])
++    controller.tick()
++    assert state["calls"] == []
++    assert controller.last_decision["planned_reload_tokens"] == 0
++    assert controller.last_decision["planned_evict_tokens"] == 0
++
++
++@patch.object(floor.time, "monotonic", return_value=10)
++def test_below_floor_reloads_only_the_difference(_):
++    controller, state = make_controller([("a", 12, 16, 0)])
++    controller.tick()
++    assert state["calls"] == [("a", 9)]
++    assert controller.last_decision["planned_reload_tokens"] == 9
++    assert controller.last_decision["planned_evict_tokens"] == 0
++
++
++@patch.object(floor.time, "monotonic", return_value=10)
++def test_no_shortfall_never_proactively_evicts_above_floor(_):
++    controller, state = make_controller([("far", 20, 16, 16)])
++    controller.tick()
++    assert state["resident"]["far"] == 16
++    assert state["free"] == 0
++
++
++@patch.object(floor.time, "monotonic", return_value=10)
++def test_idle_reserve_evicts_one_bounded_far_deadline_step(_):
++    controller, state = make_controller(
++        [("near", 12, 16, 16), ("far", 20, 16, 16)],
++        shared=100,
++        per_session=100,
++        capacity=100,
++    )
++    controller.cache.deadline_floor_scheduler_idle = True
++    controller.idle_since = 0
++    freed = controller.tick()
++    assert freed == 2
++    assert state["calls"] == [("far", 14)]
++    assert controller.last_decision["mode"] == "IDLE_RESERVE"
++    assert controller.last_decision["reserve_high_tokens"] == 15
++
++
++@patch.object(floor.time, "monotonic", return_value=10)
++def test_idle_reserve_defers_while_scheduler_is_busy(_):
++    controller, state = make_controller(
++        [("far", 20, 16, 16)], shared=100, per_session=100
++    )
++    controller.idle_since = 0
++    controller.tick()
++    assert state["calls"] == []
++    assert controller.last_decision["reserve_deferred"] == "scheduler_busy"
++
++
++@patch.object(floor.time, "monotonic", return_value=10)
++def test_idle_reserve_observes_grace_and_cooldown(_):
++    controller, state = make_controller(
++        [("far", 20, 16, 16)], shared=100, per_session=100
++    )
++    controller.cache.deadline_floor_scheduler_idle = True
++    controller.tick()
++    assert state["calls"] == []
++    assert controller.last_decision["reserve_deferred"] == "idle_grace"
++
++    controller.last_tick = 0
++    controller.idle_since = 0
++    controller.last_reserve = 9.8
++    controller.tick()
++    assert state["calls"] == []
++    assert controller.last_decision["reserve_deferred"] == "cooldown"
++
++
++@patch.object(floor.time, "monotonic", return_value=10)
++def test_high_watermark_stops_idle_reserve(_):
++    controller, state = make_controller(
++        [("far", 20, 16, 16)], shared=100, per_session=100, free=15
++    )
++    controller.cache.deadline_floor_scheduler_idle = True
++    controller.idle_since = 0
++    controller.reserve_active = True
++    controller.tick()
++    assert state["calls"] == []
++    assert controller.reserve_active is False
++    assert controller.last_decision["reserve_requested_tokens"] == 0
++
++
++@patch.object(floor.time, "monotonic", return_value=10)
++def test_shortfall_evicts_far_deadline_first_without_crossing_floor(_):
++    controller, state = make_controller([("near", 12, 16, 16), ("far", 20, 16, 16)])
++    freed = controller.tick(shortfall=5)
++    assert freed == 5
++    assert state["calls"] == [("far", 11)]
++    assert state["resident"]["near"] == 16
++    assert controller.last_decision["planned_evict_tokens"] == 5
++
++
++@patch.object(floor.time, "monotonic", return_value=10)
++def test_shared_edf_prefix_reloads_when_each_session_alone_would_fit(_):
++    controller, state = make_controller(
++        [("a", 12, 10, 5), ("b", 12, 10, 5)], shared=4, per_session=4
++    )
++    # Each request's five missing tokens fit alone in 1.8 seconds, but the
++    # shared link can carry only 7.2 tokens across both requests.
++    controller.tick()
++    assert sum(new - 5 for _, new in state["calls"]) == 3
++    jobs = controller.snapshot()
++    missing = {job.sid: job.total - job.resident for job in jobs}
++    assert feasible(jobs, missing, 10.2, 4, 4)
++
++
++@patch.object(floor.time, "monotonic", return_value=10)
++def test_safety_factor_reduces_committed_bandwidth(_):
++    controller, _ = make_controller(
++        [("a", 12, 10, 5)], shared=10, per_session=8, safety=0.9
++    )
++    assert controller.budget_shared == 9
++    assert controller.budget_per_session == 7.2
++
++
++@patch.object(floor.time, "monotonic", return_value=10)
++def test_inflight_h2d_freezes_floor_and_demand_changes(_):
++    controller, state = make_controller([("a", 12, 16, 0)])
++    controller.cache.ongoing_load_back = {1: object()}
++    assert controller.tick(shortfall=4) == 0
++    assert state["calls"] == []
++    assert controller.last_decision["deferred"] == "h2d_inflight"
++
++
++@patch.object(floor.time, "monotonic", return_value=10)
++def test_begin_preserves_residency_and_end_requests_full_residency(_):
++    controller, state = make_controller([("a", 20, 16, 8)])
++    controller.deadlines.clear()
++    result = controller.update("a", "begin", 2)
++    assert controller.deadlines["a"] == 12
++    assert state["calls"] == []
++    assert controller.last_tick == 0
++    assert result == {"applied": True, "action": "none", "registered": True}
++    controller.update("a", "end", None)
++    assert "a" not in controller.deadlines
++    assert state["calls"] == [("a", 16)]
++
++
++def test_allocator_shortfall_uses_floor_then_native_remainder():
++    source = ROOT / "python/sglang/srt/mem_cache/unified_radix_cache.py"
++    tree = ast.parse(source.read_text(encoding="utf-8"))
++    cls = next(
++        node
++        for node in tree.body
++        if isinstance(node, ast.ClassDef) and node.name == "UnifiedRadixCache"
++    )
++    method = next(
++        node
++        for node in cls.body
++        if isinstance(node, ast.FunctionDef) and node.name == "evict_for_alloc"
++    )
++    method.decorator_list = []
++
++    @dataclass
++    class Params:
++        num_tokens: int = 0
++
++    @dataclass
++    class Result:
++        num_tokens_evicted: int = 0
++
++    namespace = {
++        "ComponentType": SimpleNamespace(FULL=0),
++        "EvictParams": Params,
++        "EvictResult": Result,
++        "logger": SimpleNamespace(warning=lambda *args: None),
++        "replace": replace,
++    }
++    exec(  # noqa: S102 - execute the extracted shipped method in a stub namespace
++        compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"),
++        namespace,
++    )
++
++    state = {"free": 0, "safe": 3, "native": []}
++
++    def floor_tick(shortfall):
++        freed = min(state["safe"], shortfall)
++        state["free"] += freed
++        state["safe"] -= freed
++        return freed
++
++    def native(params):
++        state["native"].append(params.num_tokens)
++        return Result(params.num_tokens)
++
++    cache = SimpleNamespace(
++        disable=False,
++        two_phase_enabled=False,
++        deadline_floor_enabled=True,
++        _get_deadline_floor_controller=lambda: SimpleNamespace(
++            tick=floor_tick, last_decision={}
++        ),
++        _component_available_size=lambda _: state["free"],
++        _evict_for_alloc_native=native,
++    )
++    result = namespace["evict_for_alloc"](cache, Params(5))
++    assert result.num_tokens_evicted == 5
++    assert state["native"] == [2]
+diff --git a/test/registered/unit/mem_cache/test_pressure_telemetry.py b/test/registered/unit/mem_cache/test_pressure_telemetry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..24959f4b42d5c078423a6d0912b81df220c9047a
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_pressure_telemetry.py
+@@ -0,0 +1,132 @@
++import importlib.util
++from pathlib import Path
++import unittest
++from types import SimpleNamespace
++
++
++SOURCE = Path(__file__).resolve().parents[4] / "python/sglang/srt/mem_cache/joint_policy/pressure_telemetry.py"
++SPEC = importlib.util.spec_from_file_location("pressure_telemetry", SOURCE)
++MODULE = importlib.util.module_from_spec(SPEC)
++SPEC.loader.exec_module(MODULE)
++PressureSampler = MODULE.PressureSampler
++
++
++class FakeCache:
++    def __init__(self, capacity=100, available=20, evictable=30, inflight=2):
++        self.token_to_kv_pool_allocator = SimpleNamespace(size_full=capacity)
++        self.tree_components = ["FULL"]
++        self.available = available
++        self.evictable = evictable
++        self.ongoing_load_back = dict.fromkeys(range(inflight))
++        self.cache_controller = None
++
++    def _component_available_size(self, component):
++        self.assert_component = component
++        return self.available
++
++    def full_evictable_size(self):
++        return self.evictable
++
++
++class PressureSamplerTest(unittest.TestCase):
++    def test_admission_intervals_survive_sampling_gaps(self):
++        sampler = PressureSampler(1, clock=lambda: 1, queue_clock=lambda: 105)
++        sampler.maybe_sample(FakeCache(), 2, [100, 104])
++        event = sampler.admitted_queue_intervals(iter([100, 104]))
++        self.assertEqual(event, dict(queue_clock_s=105, entry_times_s=[100, 104],
++                                    admitted_episodes=2, invalid_entry_times=0))
++        self.assertEqual(sampler.last_sample, 1)
++        self.assertIsNone(sampler.maybe_sample(FakeCache(), 0))
++
++    def test_admission_reports_invalid_or_missing_entries(self):
++        sampler = PressureSampler(1, queue_clock=lambda: 100)
++        event = sampler.admitted_queue_intervals([0, 101, float("nan"), 99])
++        self.assertEqual(event["entry_times_s"], [99])
++        self.assertEqual(event["invalid_entry_times"], 3)
++        self.assertEqual(sampler.admitted_queue_intervals([])["admitted_episodes"], 0)
++
++    def test_accounting_and_elapsed_time(self):
++        times = iter((10.0, 10.2, 10.6, 12.0))
++        sampler = PressureSampler(0.5, clock=lambda: next(times))
++        cache = FakeCache()
++        first = sampler.maybe_sample(cache, 3)
++        self.assertEqual(first["allocated_tokens"], 80)
++        self.assertEqual(first["non_evictable_tokens"], 50)
++        self.assertEqual(first["allocation_usage"], 0.8)
++        self.assertEqual(first["non_evictable_usage"], 0.5)
++        self.assertEqual(first["h2d_inflight_nodes"], 2)
++        self.assertIsNone(sampler.maybe_sample(cache, 3))
++        second = sampler.maybe_sample(cache, 4)
++        self.assertAlmostEqual(second["elapsed_since_sample_s"], 0.6)
++        self.assertEqual(second["waiting_requests"], 4)
++        third = sampler.maybe_sample(cache, 0)
++        self.assertAlmostEqual(third["elapsed_since_sample_s"], 1.4)
++
++    def test_invalid_accounting_does_not_advance_timer(self):
++        times = iter((1.0, 1.1))
++        sampler = PressureSampler(0.5, clock=lambda: next(times))
++        with self.assertRaises(ValueError):
++            sampler.maybe_sample(FakeCache(available=80, evictable=30), 0)
++        self.assertIsNotNone(sampler.maybe_sample(FakeCache(), 0))
++
++    def test_h2d_queue_stages_are_counted_once(self):
++        cache = FakeCache()
++        cache.cache_controller = SimpleNamespace(
++            load_queue=[SimpleNamespace(device_indices=[1, 2, 3])],
++            ack_load_queue=[SimpleNamespace(num_tokens=4, num_bytes=48)],
++            _transfer_num_bytes=lambda op: 12 * len(op.device_indices),
++        )
++        sample = PressureSampler(1, clock=lambda: 1).maybe_sample(cache, 0)
++        self.assertEqual(sample["h2d_queued_tokens"], 3)
++        self.assertEqual(sample["h2d_queued_bytes"], 36)
++        self.assertEqual(sample["h2d_submitted_tokens"], 4)
++        self.assertEqual(sample["h2d_submitted_bytes"], 48)
++        self.assertEqual(sample["h2d_reserved_tokens"], 7)
++        self.assertEqual(sample["allocated_tokens"], 80)
++        self.assertEqual(sample["h2d_inflight_nodes"], 2)
++
++    def test_interval_and_waiting_validation(self):
++        with self.assertRaises(ValueError):
++            PressureSampler(0)
++        with self.assertRaises(ValueError):
++            PressureSampler(61)
++        with self.assertRaises(ValueError):
++            PressureSampler(1, clock=lambda: 1).maybe_sample(FakeCache(), -1)
++
++    def test_backward_clock_is_rejected_before_interval_gate(self):
++        times = iter((10.0, 9.9))
++        sampler = PressureSampler(1, clock=lambda: next(times))
++        sampler.maybe_sample(FakeCache(), 0)
++        with self.assertRaisesRegex(ValueError, "clock moved backward"):
++            sampler.maybe_sample(FakeCache(), 0)
++
++    def test_prefill_defer_attempts_accumulate_until_sample(self):
++        times = iter((1.0, 1.1, 1.5))
++        sampler = PressureSampler(0.5, clock=lambda: next(times))
++        sampler.record_prefill_defer("no_token")
++        first = sampler.maybe_sample(FakeCache(), 1)
++        self.assertEqual(first["prefill_no_token_attempts"], 1)
++        sampler.record_prefill_defer("no_token")
++        sampler.record_prefill_defer("no_token")
++        sampler.record_prefill_defer("prefetch_pending")
++        self.assertIsNone(sampler.maybe_sample(FakeCache(), 1))
++        second = sampler.maybe_sample(FakeCache(), 1)
++        self.assertEqual(second["prefill_no_token_attempts"], 2)
++        self.assertEqual(second["prefill_prefetch_pending_attempts"], 1)
++        with self.assertRaises(ValueError):
++            sampler.record_prefill_defer("unknown")
++
++    def test_waiting_age_uses_queue_clock_and_reports_missing_entries(self):
++        sampler = PressureSampler(1, clock=lambda: 5, queue_clock=lambda: 100)
++        sample = sampler.maybe_sample(FakeCache(), 4, [99.9, 99.8, 99.7, 0])
++        self.assertEqual(sample["waiting_age_observed_requests"], 3)
++        self.assertAlmostEqual(sample["waiting_age_max_s"], .3)
++        self.assertAlmostEqual(sample["waiting_age_p95_s"], .3)
++        empty = PressureSampler(1, clock=lambda: 5).maybe_sample(FakeCache(), 0)
++        self.assertIsNone(empty["waiting_age_max_s"])
++        with self.assertRaises(ValueError):
++            PressureSampler(1, clock=lambda: 5).maybe_sample(FakeCache(), 0, [1])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/mem_cache/test_probability_residency.py b/test/registered/unit/mem_cache/test_probability_residency.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4302c6edcee00f6b9e89694bbb38e669017d3158
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_probability_residency.py
+@@ -0,0 +1,81 @@
++import importlib.util
++import sys
++from pathlib import Path
++
++import pytest
++
++_MODULE_PATH = (
++    Path(__file__).resolve().parents[4]
++    / "python"
++    / "sglang"
++    / "srt"
++    / "mem_cache"
++    / "joint_policy"
++    / "probability_residency.py"
++)
++_SPEC = importlib.util.spec_from_file_location("probability_residency", _MODULE_PATH)
++assert _SPEC is not None and _SPEC.loader is not None
++_MODULE = importlib.util.module_from_spec(_SPEC)
++sys.modules[_SPEC.name] = _MODULE
++_SPEC.loader.exec_module(_MODULE)
++decide = _MODULE.decide_probability_residency
++ReloadMicrobatchState = _MODULE.ReloadMicrobatchState
++
++
++def test_probability_controls_page_aligned_target():
++    decision = decide(
++        total_tokens=100, resident_tokens=100, return_probability=0.33, page_size=16
++    )
++    assert decision.target_tokens == 48
++    assert decision.evict_tokens == 52
++    assert decision.reload_tokens == 0
++
++
++def test_probability_growth_proactively_requests_reload_before_return():
++    decision = decide(
++        total_tokens=128, resident_tokens=32, return_probability=0.75, page_size=16
++    )
++    assert decision.target_tokens == 96
++    assert decision.reload_tokens == 64
++
++
++@pytest.mark.parametrize("probability,target", [(0.0, 0), (1.0, 127)])
++def test_probability_endpoints(probability, target):
++    decision = decide(
++        total_tokens=127,
++        resident_tokens=0,
++        return_probability=probability,
++        page_size=16,
++    )
++    assert decision.target_tokens == target
++
++
++def test_rejects_invalid_probability():
++    with pytest.raises(ValueError, match="return_probability"):
++        decide(
++            total_tokens=128,
++            resident_tokens=64,
++            return_probability=1.1,
++            page_size=16,
++        )
++
++
++def test_reload_microbatch_waits_then_merges_operations():
++    batch = ReloadMicrobatchState(window_s=0.1)
++    batch.enqueue(100, now=10.0)
++    batch.enqueue(200, now=10.04)
++    assert not batch.should_flush(now=10.099)
++    assert batch.should_flush(now=10.1)
++    assert batch.drain(now=10.1) == {
++        "operations": 2,
++        "planned_tokens": 300,
++        "urgent": False,
++        "aggregation_wait_ms": 100.0,
++    }
++    assert not batch.should_flush(now=11.0)
++
++
++def test_reload_microbatch_urgent_flushes_without_waiting():
++    batch = ReloadMicrobatchState(window_s=0.1)
++    batch.enqueue(128, urgent=True, now=20.0)
++    assert batch.should_flush(now=20.001)
+diff --git a/test/registered/unit/mem_cache/test_producer_reserve.py b/test/registered/unit/mem_cache/test_producer_reserve.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..76ba990f07501238600e927990261fbc55c91cf7
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_producer_reserve.py
+@@ -0,0 +1,88 @@
++"""Tests for the H2D producer-slot reserve used by the proactive flush.
++
++``LayerDoneCounter`` has 3 slots and two producers: the proactive policy
++flush, and the prefill path in ``_get_new_batch_prefill_raw``, which calls
++``ready_to_load_host_cache`` unguarded because it already has a batch to
++serve. A background producer that only checks the next slot can therefore
++take the slot the request path is about to need, which asserts inside
++``update_producer`` under the prefill traceback.
++
++The real method is bound to a stub counter so these cases exercise the
++shipped implementation without needing a CUDA device.
++"""
++
++from types import SimpleNamespace
++
++from sglang.srt.managers.cache_controller import HiCacheController
++
++
++def make_controller(ready_flags, producer_index):
++    """Bind the real can_start_loading to a stub with the given slot states."""
++    events = [
++        SimpleNamespace(finish_event=SimpleNamespace(query=lambda r=r: r))
++        for r in ready_flags
++    ]
++    stub = SimpleNamespace(
++        layer_done_counter=SimpleNamespace(
++            events=events, producer_index=producer_index
++        )
++    )
++    return HiCacheController.can_start_loading.__get__(stub)
++
++
++def test_reserve_zero_only_checks_next_slot():
++    # Next slot free, the one after is in flight: legal without a reserve.
++    can = make_controller([True, True, False], producer_index=0)
++    assert can() is True
++    assert can(reserve=0) is True
++
++
++def test_reserve_one_also_requires_the_slot_after_next():
++    # Same state: with a reserve the proactive producer must decline, leaving
++    # the in-flight-adjacent slot for the request path.
++    can = make_controller([True, True, False], producer_index=0)
++    assert can(reserve=1) is False
++
++
++def test_reserve_one_allows_when_two_slots_are_free():
++    can = make_controller([False, True, True], producer_index=0)
++    assert can(reserve=1) is True
++
++
++def test_next_slot_in_flight_blocks_every_reserve():
++    can = make_controller([True, False, True], producer_index=0)
++    assert can() is False
++    assert can(reserve=0) is False
++    assert can(reserve=1) is False
++
++
++def test_index_walk_wraps_around_the_ring():
++    # producer_index=2 -> next is 0, then 1.
++    can = make_controller([True, False, True], producer_index=2)
++    assert can(reserve=0) is True
++    assert can(reserve=1) is False
++
++    can = make_controller([True, True, False], producer_index=2)
++    assert can(reserve=1) is True
++
++
++def test_initial_producer_index_minus_one_starts_at_slot_zero():
++    can = make_controller([False, True, True], producer_index=-1)
++    assert can(reserve=0) is False
++
++    can = make_controller([True, False, True], producer_index=-1)
++    assert can(reserve=0) is True
++    assert can(reserve=1) is False
++
++
++def test_negative_reserve_is_treated_as_zero():
++    can = make_controller([True, True, False], producer_index=0)
++    assert can(reserve=-1) is True
++
++
++def test_full_reserve_requires_the_whole_ring_free():
++    can = make_controller([True, True, True], producer_index=0)
++    assert can(reserve=2) is True
++
++    can = make_controller([False, True, True], producer_index=0)
++    assert can(reserve=2) is False
+diff --git a/test/registered/unit/mem_cache/test_release_host_resources_order.py b/test/registered/unit/mem_cache/test_release_host_resources_order.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d385fc9c0431f37a608cb3ea6d5e1917660e6a11
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_release_host_resources_order.py
+@@ -0,0 +1,44 @@
++"""Regression test for graceful HiCache shutdown ordering."""
++
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
++
++
++def test_release_host_resources_stops_storage_before_destroying_host_pool():
++    calls = []
++    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
++    cache.linker = SimpleNamespace(close=lambda: calls.append("linker.close"))
++    cache.cache_controller = SimpleNamespace(
++        detach_storage_backend=lambda: calls.append("controller.detach")
++    )
++    cache.host_pool_group = SimpleNamespace(
++        destroy=lambda: calls.append("host_pool.destroy")
++    )
++
++    cache.release_host_resources()
++
++    assert calls == [
++        "linker.close",
++        "controller.detach",
++        "host_pool.destroy",
++    ]
++
++
++def test_release_host_resources_does_not_destroy_pool_if_threads_fail_to_stop():
++    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
++    cache.linker = None
++    cache.cache_controller = SimpleNamespace(
++        detach_storage_backend=Mock(side_effect=RuntimeError("thread still alive"))
++    )
++    cache.host_pool_group = SimpleNamespace(destroy=Mock())
++
++    try:
++        cache.release_host_resources()
++    except RuntimeError as exc:
++        assert "thread still alive" in str(exc)
++    else:
++        raise AssertionError("shutdown must fail closed when a storage thread is alive")
++
++    cache.host_pool_group.destroy.assert_not_called()
+diff --git a/test/registered/unit/mem_cache/test_residency_invariants.py b/test/registered/unit/mem_cache/test_residency_invariants.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a23c6c169e9c55d9701868489a11e686085cf52c
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_residency_invariants.py
+@@ -0,0 +1,98 @@
++"""Tests for the lock-independent FULL residency contiguity probe."""
++
++import importlib.util
++import sys
++from pathlib import Path
++
++_MODULE_PATH = (
++    Path(__file__).resolve().parents[4]
++    / "python"
++    / "sglang"
++    / "srt"
++    / "mem_cache"
++    / "joint_policy"
++    / "residency_invariants.py"
++)
++_SPEC = importlib.util.spec_from_file_location("residency_invariants", _MODULE_PATH)
++assert _SPEC is not None and _SPEC.loader is not None
++_MODULE = importlib.util.module_from_spec(_SPEC)
++sys.modules[_SPEC.name] = _MODULE
++_SPEC.loader.exec_module(_MODULE)
++NodeResidency = _MODULE.NodeResidency
++find = _MODULE.find_residency_contiguity_violations
++
++
++def chain(*layers):
++    """Build a root-anchored chain; each layer is (has_device, has_host)."""
++    nodes = []
++    for i, (dev, host) in enumerate(layers):
++        nodes.append(
++            NodeResidency(
++                node_id=i + 1,
++                parent_id=None if i == 0 else i,
++                has_device=dev,
++                has_host=host,
++            )
++        )
++    return nodes
++
++
++def test_fully_resident_chain_is_clean():
++    assert find(chain((True, True), (True, True)), is_write_back=False) == []
++
++
++def test_device_evicted_from_the_bottom_is_clean():
++    # The legal shape: device residency shrinks from the leaf upward, so the
++    # resident segment stays contiguous from the root.
++    nodes = chain((True, True), (True, True), (False, True), (False, True))
++    assert find(nodes, is_write_back=False) == []
++
++
++def test_device_hole_above_resident_descendant_is_reported():
++    # The shape that later trips acquire_component_lock: node 3 holds a device
++    # value while its parent 2 is evicted.
++    nodes = chain((True, True), (False, True), (True, True))
++    violations = find(nodes, is_write_back=False)
++    assert len(violations) == 1
++    assert "node 3 device present but parent 2 evicted" in violations[0]
++
++
++def test_dead_node_with_neither_layer_is_reported():
++    nodes = chain((True, True), (False, False))
++    violations = find(nodes, is_write_back=False)
++    assert any("node 2 dead" in v for v in violations)
++
++
++def test_host_contiguity_enforced_only_outside_write_back():
++    # A host-only hole: node 2 is backed up, its parent is not.
++    nodes = [
++        NodeResidency(node_id=1, parent_id=None, has_device=True, has_host=False),
++        NodeResidency(node_id=2, parent_id=1, has_device=True, has_host=True),
++    ]
++    assert any(
++        "not backed up" in v for v in find(nodes, is_write_back=False)
++    )
++    # write_back reclaims the Full host layer independently, so the same shape
++    # is legal there.
++    assert find(nodes, is_write_back=True) == []
++
++
++def test_root_parented_nodes_are_never_violations():
++    # parent_id None means the parent is the root, which always holds a value.
++    nodes = [NodeResidency(node_id=1, parent_id=None, has_device=True, has_host=False)]
++    assert find(nodes, is_write_back=False) == []
++
++
++def test_missing_parent_is_reported():
++    nodes = [NodeResidency(node_id=5, parent_id=4, has_device=True, has_host=True)]
++    violations = find(nodes, is_write_back=False)
++    assert len(violations) == 1
++    assert "parent 4 missing from tree" in violations[0]
++
++
++def test_multiple_violations_are_all_collected():
++    nodes = chain((True, True), (False, True), (True, True), (False, False))
++    violations = find(nodes, is_write_back=False)
++    assert len(violations) == 2
++    assert any("node 3 device present but parent 2 evicted" in v for v in violations)
++    assert any("node 4 dead" in v for v in violations)
+diff --git a/test/registered/unit/mem_cache/test_residency_noop.py b/test/registered/unit/mem_cache/test_residency_noop.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..573013a1d754c3ecb77abfae0a7deb3d6789e01d
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_residency_noop.py
+@@ -0,0 +1,75 @@
++"""Exercise the real method without importing the GPU runtime."""
++import ast
++import importlib.util
++from pathlib import Path
++import sys
++from types import SimpleNamespace
++from typing import Optional
++from unittest.mock import Mock
++
++import pytest
++
++ROOT = Path(__file__).resolve().parents[4] / 'python/sglang/srt/mem_cache'
++spec = importlib.util.spec_from_file_location(
++    'noop_probability', ROOT / 'joint_policy/probability_residency.py')
++model = importlib.util.module_from_spec(spec)
++sys.modules[spec.name] = model
++spec.loader.exec_module(model)
++tree = ast.parse((ROOT / 'unified_radix_cache.py').read_text(encoding='utf-8'))
++cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
++           and n.name == 'UnifiedRadixCache')
++method = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
++              and n.name == 'set_tool_return_probability')
++method.decorator_list = []
++space = dict(Optional=Optional, BASE_COMPONENT_TYPE=0,
++             decide_probability_residency=model.decide_probability_residency)
++exec(compile(ast.Module(body=[method], type_ignores=[]), '<real-method>', 'exec'), space)
++
++
++def cache(resident=16, pressure=2.0, usage=.9):
++    nodes = [SimpleNamespace(key=range(resident),
++                             component_data=[SimpleNamespace(value=object())])]
++    if resident < 16:
++        nodes.append(SimpleNamespace(key=range(16-resident),
++                                     component_data=[SimpleNamespace(value=None)]))
++    return SimpleNamespace(
++        enable_session_radix_cache=True, cache_controller=object(), page_size=1,
++        probability_residency_check=True, probability_evict_pressure=pressure,
++        probability_reload_foreground_first=False, probability_foreground_pending=False,
++        _session_full_path=lambda _: nodes, _device_token_usage=lambda: usage,
++        check_probability_residency_contiguity=Mock(return_value=[]),
++        _split_full_path_at=Mock(side_effect=RuntimeError('mutation reached')))
++
++
++@pytest.mark.parametrize('resident,target', [(16, .5), (16, 1), (8, .5)])
++def test_blocked_or_already_satisfied_target_never_splits(resident, target):
++    c = cache(resident)
++    result = space['set_tool_return_probability'](c, 'sid', target)
++    assert result['evicted_tokens'] == 0
++    c._split_full_path_at.assert_not_called()
++    c.check_probability_residency_contiguity.assert_called_once()
++    if resident == 16 and target == .5:
++        assert result['evict_stop_reason'] == 'below_pressure'
++        assert result['planned_evict_tokens'] == 8
++
++
++@pytest.mark.parametrize('resident,target,pressure', [(16, .5, .8), (8, 1, 2)])
++def test_real_eviction_and_reload_still_reach_mutation(resident, target, pressure):
++    c = cache(resident, pressure)
++    with pytest.raises(RuntimeError, match='mutation reached'):
++        space['set_tool_return_probability'](c, 'sid', target)
++    c._split_full_path_at.assert_called_once()
++
++
++def test_foreground_queue_defers_speculation_without_splitting():
++    c = cache(resident=8)
++    c.probability_reload_foreground_first = True
++    c.probability_foreground_pending = True
++    result = space['set_tool_return_probability'](c, 'sid', 1)
++    assert result['action'] == 'reload_deferred'
++    assert result['reload_defer_reason'] == 'foreground_queue'
++    assert result['planned_reload_tokens'] == 8
++    c._split_full_path_at.assert_not_called()
++    c.probability_foreground_pending = False
++    with pytest.raises(RuntimeError, match='mutation reached'):
++        space['set_tool_return_probability'](c, 'sid', 1)
+diff --git a/test/registered/unit/mem_cache/test_transfer_journal.py b/test/registered/unit/mem_cache/test_transfer_journal.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..12cfac197240301fcb11c49af94a8a8c9a5b44d6
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_transfer_journal.py
+@@ -0,0 +1,163 @@
++"""CPU lifecycle tests and real base/hybrid enqueue methods with fake allocators."""
++
++import ast
++import importlib.util
++from pathlib import Path
++from types import SimpleNamespace
++import unittest
++
++
++ROOT = Path(__file__).resolve().parents[4]
++SOURCE = ROOT / "python/sglang/srt/observability/transfer_journal.py"
++SPEC = importlib.util.spec_from_file_location("transfer_journal", SOURCE)
++MODULE = importlib.util.module_from_spec(SPEC)
++SPEC.loader.exec_module(MODULE)
++TransferJournal = MODULE.TransferJournal
++
++
++def methods(path, class_name, names, namespace):
++    tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
++    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
++               and n.name == class_name)
++    nodes = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
++    # Execute the actual methods without importing torch/distributed/GPU code.
++    module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[
++        ast.alias(name="annotations")], level=0)] + nodes, type_ignores=[])
++    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
++    return {name: namespace[name] for name in names}
++
++
++class FakeOperation:
++    counter = 0
++
++    def __init__(self, host, device, node, priority, **kwargs):
++        self.id = FakeOperation.counter
++        FakeOperation.counter += 1
++        self.device_indices = device
++        self.node_ids = [node]
++
++
++class Indices(list):
++    def numel(self):
++        return len(self)
++
++
++class TransferJournalTest(unittest.TestCase):
++    def test_actual_submit_and_ack_retire_only_after_tree_commit(self):
++        order = []
++        journal = TransferJournal(lambda event: order.append(event["stage"]))
++        journal.enqueue("12", 2, 64)
++        operation = SimpleNamespace(device_indices=[1, 2], node_ids=[42])
++        op_type = SimpleNamespace(merge_ops=lambda ops: operation)
++        start = methods("python/sglang/srt/managers/cache_controller.py",
++                        "HiCacheController", {"start_loading"},
++                        {"CacheOperation": op_type, "HiCacheAck": SimpleNamespace})
++        finish_event = SimpleNamespace(synchronize=lambda: order.append("sync"))
++        completion = SimpleNamespace(start_event=None, finish_event=finish_event,
++                                     timing_enabled=False)
++        controller = SimpleNamespace(
++            load_queue=[SimpleNamespace(id=12)], ack_load_queue=[],
++            reload_trace=None, transfer_journal=journal, load_fence_stream=None,
++            layer_done_counter=SimpleNamespace(update_producer=lambda: 0, events=[
++                SimpleNamespace(start_event=SimpleNamespace(record=lambda: None),
++                                complete=lambda layer: None)]),
++            _move_op_indices=lambda op: ([], [], []),
++            _l2_load_transfers=lambda *args: [], transfer_layer_id_max=1,
++            l2_transfer_engine=SimpleNamespace(submit_host_to_device=lambda *a, **k: completion),
++            _num_tokens_by_pool=lambda op: {"kv": 2},
++            _transfer_num_bytes=lambda op: 64)
++        self.assertEqual(start["start_loading"](controller), 0)
++        self.assertEqual(journal.active["12"][0], "submitted")
++        self.assertEqual(controller.load_queue, [])
++        cache = SimpleNamespace(
++            cache_controller=controller, buffer_pipeline=None,
++            ongoing_load_back={42: (42, None, None)}, metrics_collector=None,
++            dec_lock_ref=lambda *args: order.append("unlock"),
++            dec_host_lock_ref=lambda *args: None,
++            tree_core=SimpleNamespace(finish_load_back=lambda node: order.append("tree_commit")))
++        check = methods("python/sglang/srt/mem_cache/unified_radix_cache.py",
++                        "UnifiedRadixCache", {"loading_check"}, {})
++        check["loading_check"](cache, finish_count=1)
++        self.assertEqual(order, ["queued", "submitted", "sync", "unlock",
++                                 "tree_commit", "acknowledged"])
++        self.assertEqual(journal.active, {})
++
++    def test_merged_submission_conserves_bytes_and_retires_entries(self):
++        events = []
++        journal = TransferJournal(events.append, clock=lambda: 7)
++        journal.enqueue("a", 2, 100)
++        journal.enqueue("b", 3, 200)
++        journal.submit(["a", "b"])
++        self.assertEqual(events[-1]["submitted_bytes"], 300)
++        self.assertEqual(events[-1]["submitted_ops"], 2)
++        journal.complete(["a", "b"])
++        self.assertEqual(journal.active, {})
++        self.assertEqual(events[-1]["completed_bytes"], 300)
++        self.assertEqual(events[-1]["completed_tokens"], 5)
++        self.assertEqual(events[-1]["completed_ops"], 2)
++
++    def test_invalid_batch_is_atomic(self):
++        journal = TransferJournal(lambda event: None)
++        journal.enqueue("a", 0, 64)  # extra-pool-only operation is valid
++        for ids in (["a", "missing"], ["a", "a"], []):
++            with self.assertRaises(ValueError):
++                journal.submit(ids)
++            self.assertEqual(journal.active["a"][0], "queued")
++        with self.assertRaises(ValueError):
++            journal.complete(["a"])
++        with self.assertRaises(ValueError):
++            journal.enqueue("a", 0, 64)
++
++    def test_reset_reports_unresolved_without_claiming_completion(self):
++        events = []
++        journal = TransferJournal(events.append)
++        journal.enqueue("a", 2, 100)
++        journal.enqueue("b", 3, 200)
++        journal.submit(["a"])
++        journal.reset()
++        self.assertEqual(events[-1]["stage"], "reset_unresolved")
++        self.assertEqual(set(events[-1]["operation_ids"]), {"a", "b"})
++        self.assertEqual(events[-1]["submitted_bytes"], 100)
++        self.assertEqual(events[-1]["queued_bytes"], 200)
++        self.assertEqual(events[-1]["completed_ops"], 0)
++        self.assertEqual(journal.active, {})
++
++    def test_base_and_hybrid_allocation_paths_share_actual_entry(self):
++        base = methods("python/sglang/srt/managers/cache_controller.py",
++                       "HiCacheController", {"load", "_enqueue_load_operation"},
++                       {"CacheOperation": FakeOperation})
++        hybrid = methods("python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py",
++                         "HybridCacheController", {"load"},
++                         {"CacheOperation": FakeOperation})
++        for load in (base["load"], hybrid["load"]):
++            with self.subTest(load=load.__code__.co_filename):
++                events, traces, freed = [], [], []
++                allocation = SimpleNamespace(alloc=lambda n: Indices(range(n)),
++                                             free=freed.append)
++                controller = SimpleNamespace(
++                    mem_pool_device_allocator=allocation, load_queue=[],
++                    transfer_journal=TransferJournal(events.append),
++                    reload_trace=SimpleNamespace(emit=lambda *a, **k: traces.append((a, k))),
++                    _transfer_num_bytes=lambda op: len(op.device_indices) * 32,
++                    _resolve_device_transfers=lambda *a, **k: [])
++                controller._enqueue_load_operation = lambda op: base[
++                    "_enqueue_load_operation"](controller, op)
++                self.assertEqual(len(load(controller, Indices([1, 2]))), 2)
++                self.assertEqual(len(controller.load_queue), 1)
++                self.assertEqual(events[-1]["queued_bytes"], 64)
++                self.assertEqual(traces[0][1]["bytes"], 64)
++                allocation.alloc = lambda n: None
++                self.assertIsNone(load(controller, Indices([1])))
++                self.assertEqual(len(events), 1)
++                # Hybrid failure after full-pool allocation rolls back; never
++                # registers an operation for the unsuccessful extra pools.
++                if load is hybrid["load"]:
++                    allocation.alloc = lambda n: Indices(range(n))
++                    controller._resolve_device_transfers = lambda *a, **k: None
++                    self.assertIsNone(load(controller, Indices([1]), extra_pools=[1]))
++                    self.assertEqual(len(freed), 1)
++                    self.assertEqual(len(events), 1)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/observability/test_reload_trace.py b/test/registered/unit/observability/test_reload_trace.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3a328e414713bb28bee685ea9893d7b93689107c
+--- /dev/null
++++ b/test/registered/unit/observability/test_reload_trace.py
+@@ -0,0 +1,52 @@
++import importlib.util
++import json
++import threading
++from pathlib import Path
++
++import pytest
++
++_MODULE_PATH = (
++    Path(__file__).resolve().parents[4]
++    / "python"
++    / "sglang"
++    / "srt"
++    / "observability"
++    / "reload_trace.py"
++)
++_SPEC = importlib.util.spec_from_file_location("reload_trace_under_test", _MODULE_PATH)
++assert _SPEC is not None and _SPEC.loader is not None
++_MODULE = importlib.util.module_from_spec(_SPEC)
++_SPEC.loader.exec_module(_MODULE)
++ReloadTrace = _MODULE.ReloadTrace
++
++
++def test_reload_trace_writes_complete_json_lines(tmp_path):
++    path = tmp_path / "reload.jsonl"
++    trace = ReloadTrace(path)
++
++    threads = [
++        threading.Thread(
++            target=trace.emit,
++            args=("enqueue", "l2_to_hbm", str(index)),
++            kwargs={"bytes": index},
++        )
++        for index in range(8)
++    ]
++    for thread in threads:
++        thread.start()
++    for thread in threads:
++        thread.join()
++
++    rows = [json.loads(line) for line in path.read_text().splitlines()]
++    assert len(rows) == 8
++    assert {row["transfer_id"] for row in rows} == {str(i) for i in range(8)}
++
++
++@pytest.mark.parametrize(
++    ("event", "tier"),
++    [("bad", "l2_to_hbm"), ("enqueue", "bad")],
++)
++def test_reload_trace_rejects_invalid_values(tmp_path, event, tier):
++    trace = ReloadTrace(tmp_path / "reload.jsonl")
++    with pytest.raises(ValueError):
++        trace.emit(event, tier, "1")
