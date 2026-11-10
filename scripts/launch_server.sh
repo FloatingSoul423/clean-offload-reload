@@ -34,14 +34,14 @@ if [[ -e "$results_dir" ]]; then
   results_real="$(realpath -e -- "$results_dir")"
   case "$results_real/" in
     "$allowed_root"/*) ;;
-    *) echo "Results directory escaped allowed sxh root" >&2; exit 2 ;;
+    *) echo "Results directory escaped ALLOWED_ROOT" >&2; exit 2 ;;
   esac
 fi
 
 storage_dir="$workspace_dir/$storage_name"
 case "$storage_dir/" in
   "$allowed_root"/*) ;;
-  *) echo "Storage target escaped allowed sxh root" >&2; exit 2 ;;
+  *) echo "Storage target escaped ALLOWED_ROOT" >&2; exit 2 ;;
 esac
 [[ ! -e "$storage_dir" ]] || { echo "Storage target already exists" >&2; exit 2; }
 
@@ -55,7 +55,7 @@ mkdir -p "$trace_parent"
 trace_parent_real="$(realpath -e -- "$trace_parent")"
 case "$trace_parent_real/" in
   "$allowed_root"/*) ;;
-  *) echo "Trace path escaped allowed sxh root" >&2; exit 2 ;;
+  *) echo "Trace path escaped ALLOWED_ROOT" >&2; exit 2 ;;
 esac
 [[ ! -L "$trace_arg" ]] || { echo "Refusing symlinked trace path" >&2; exit 2; }
 export SGLANG_RELOAD_TRACE_PATH="$trace_arg"

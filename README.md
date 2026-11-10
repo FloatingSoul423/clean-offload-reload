@@ -1,9 +1,8 @@
 # Clean Offload/Reload
 
 Minimal, reproducible code for deadline-aware KV-cache offload and reload in
-[SGLang](https://github.com/sgl-project/sglang). This tag contains the patched
-runtime used by the later service-curve controllers. Check out the latest
-release tag for the current algorithm and benchmark driver.
+[SGLang](https://github.com/sgl-project/sglang). This release adds the v9.0
+cumulative EDF service-curve controller to the patched runtime.
 
 ## Prepare the runtime
 
@@ -40,6 +39,39 @@ bash scripts/launch_server.sh 0 16 run-001
 
 The server binds to `127.0.0.1:30000`. Set `SGLANG_POLICY=baseline` for a
 runtime baseline or leave it unset for deadline-floor support.
+
+## Run the controller
+
+Install the small benchmark dependencies, start the server in one terminal,
+then run the controller from the repository root in another terminal:
+
+```bash
+pip install -r requirements.txt
+export MODEL_PATH=Qwen/Qwen2.5-14B-Instruct
+bash scripts/run_benchmark.sh
+```
+
+The default workload uses four independent SWE-agent-shaped sessions for 120
+seconds. It downloads public trajectory shapes and SWE-bench issue text through
+Hugging Face. Set `ISSUES_DATASET` to a local `datasets.load_from_disk` directory
+to run offline. Outputs go to the ignored `results/` directory.
+
+The controller enforces cumulative shared-link feasibility:
+
+```text
+C(t) = safety * observed_H2D_bandwidth * t
+D(t) = sum(missing KV bytes with deadline <= t)
+require D(t) <= C(t) for every deadline prefix
+```
+
+v9.0 removes the older per-request bandwidth cap. It can use the full idle H2D
+link for one session while still accounting for all sessions together.
+
+Run the controller tests without a model or GPU:
+
+```bash
+python tests/test_service_curve.py
+```
 
 ## License and provenance
 
